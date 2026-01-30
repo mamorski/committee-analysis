@@ -1,0 +1,9 @@
+{
+    "network": {
+      "listen_address": "0.0.0.0",
+      "listen_port": 4001
+    },
+    "logging": {
+      "level": "INFO"
+    }
+  }

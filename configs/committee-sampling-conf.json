@@ -1,0 +1,51 @@
+{
+  "network": {
+    "listen_port": 0,
+    "max_outbound_degree": 4,
+    "discovery_config": {
+      "protocol_id": "/committee-sampling/1.0.0",
+      "interval": "5s",
+      "bootstrap_peers": ["/ip4/127.0.0.1/tcp/4001", "/ip4/192.168.1.113/tcp/4001"]
+    }
+  },
+  "graph": {
+    "diameter": 4,
+    "grading_levels": 3
+  },
+  "committee": {
+    "session_id": "test-session-1753023248",
+    "lambda": 256,
+    "weight": 1,
+    "total_weight": 1000,
+    "delta_w": 2.0,
+    "committee_size": 10,
+    "delay": 20
+  },
+  "synchronization": {
+    "type": 1,
+    "ex_ante_round_timeout": "5s",
+    "ex_post_round_timeout": "5s",
+    "mdag_round_timeout": "5s",
+    "building_graph_timeout": "30s",
+    "start_time": 1752311490,
+    "time_server": "time.google.com"
+  },
+  "logger": {
+    "level": "info"
+  },
+  "metrics": {
+    "enabled": true,
+    "push_gateway": {
+      "enabled": true,
+      "url": "http://localhost:9091"
+    },
+    "http_server": {
+      "enabled": false,
+      "port": 9090,
+      "path": "/metrics"
+    },
+    "push_interval": "30s",
+    "job_name": "committee-sampling-simulation",
+    "instance_name": ""
+  }
+}
