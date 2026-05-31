@@ -53,15 +53,17 @@ def _ensure_duration(value: Optional[str]) -> str:
 
 
 def parse_duration(duration: str) -> int:
-    """Parse a Go duration string into seconds. Handles compound forms like '2m30s', '1h5m'.
-
-    Note: 'ms' is matched before 'm' so '500ms' is not misread as 500 minutes.
-    """
+    """Parse a Go duration string into seconds. Handles compound forms like '2m30s', '1h5m'."""
     duration = duration.strip()
     matches = re.findall(r'(\d+)(ms|h|m|s)', duration)
     if not matches:
         return int(duration)
-    total = 0.0
+    if any(unit == 'ms' for _, unit in matches):
+        raise ValueError(
+            f"parse_duration: sub-second unit 'ms' in {duration!r} would be truncated to 0; "
+            "use seconds ('s') instead"
+        )
+    total = 0
     for value, unit in matches:
         if unit == 'h':
             total += int(value) * 3600
@@ -69,12 +71,11 @@ def parse_duration(duration: str) -> int:
             total += int(value) * 60
         elif unit == 's':
             total += int(value)
-        elif unit == 'ms':
-            total += int(value) / 1000.0
-    return int(total)
+    return total
 
 
 def append_node_drop_log(node_drop_log: Path, record: dict) -> None:
+    node_drop_log.parent.mkdir(parents=True, exist_ok=True)
     with node_drop_log.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
@@ -95,54 +96,58 @@ def drop_nodes(
     if node_drop_count == 0:
         return
 
-    # Wait until graph generation completes before dropping anything. The deadline
-    # is anchored to the protocol start_time (an absolute epoch shared with the node
-    # configs), not to this thread's start, so the drop instant does not drift with
-    # however long node launch takes.
-    wait_sec = graph_phase_deadline - time.time()
-    if wait_sec > 0 and stop_event.wait(timeout=wait_sec):
-        return
-
-    candidates = list(node_id_map.items())
-    random.shuffle(candidates)
     dropped_so_far = 0
+    try:
+        # Wait until graph generation completes before dropping anything. The deadline
+        # is anchored to the protocol start_time (an absolute epoch shared with the node
+        # configs), not to this thread's start, so the drop instant does not drift with
+        # however long node launch takes.
+        wait_sec = graph_phase_deadline - time.time()
+        if wait_sec > 0 and stop_event.wait(timeout=wait_sec):
+            return
 
-    for node_id, proc in candidates:
-        if stop_event.is_set() or dropped_so_far >= node_drop_count:
-            break
+        candidates = list(node_id_map.items())
+        random.shuffle(candidates)
 
-        if proc.poll() is None:
-            proc.terminate()
-            dropped_so_far += 1
-            timestamp = datetime.now(timezone.utc).isoformat()
-            record = {
-                "timestamp": timestamp,
-                "session_id": session_id,
-                "run_label": run_label,
-                "node_id": node_id,
-                "node_log": str(logs_dir / f"node-{node_id}.log"),
-                "dropped_so_far": dropped_so_far,
-                "node_drop_count": node_drop_count,
-                "num_nodes": num_nodes,
-                "node_drop_percent": node_drop_percent,
-            }
-            append_node_drop_log(node_drop_log, record)
-            print(f"[{timestamp}] Dropped node-{node_id} ({dropped_so_far}/{node_drop_count})")
+        for node_id, proc in candidates:
+            if stop_event.is_set() or dropped_so_far >= node_drop_count:
+                break
 
-            if dropped_so_far < node_drop_count:
-                if stop_event.wait(timeout=node_drop_interval_sec):
-                    break
+            if proc.poll() is None:
+                proc.terminate()
+                dropped_so_far += 1
+                timestamp = datetime.now(timezone.utc).isoformat()
+                record = {
+                    "timestamp": timestamp,
+                    "session_id": session_id,
+                    "run_label": run_label,
+                    "node_id": node_id,
+                    "node_log": str(logs_dir / f"node-{node_id}.log"),
+                    "dropped_so_far": dropped_so_far,
+                    "node_drop_count": node_drop_count,
+                    "num_nodes": num_nodes,
+                    "node_drop_percent": node_drop_percent,
+                }
+                append_node_drop_log(node_drop_log, record)
+                print(f"[{timestamp}] Dropped node-{node_id} ({dropped_so_far}/{node_drop_count})")
 
-    append_node_drop_log(node_drop_log, {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "session_id": session_id,
-        "run_label": run_label,
-        "summary": True,
-        "node_drop_count_configured": node_drop_count,
-        "node_drop_count_actual": dropped_so_far,
-        "num_nodes": num_nodes,
-        "node_drop_percent": node_drop_percent,
-    })
+                if dropped_so_far < node_drop_count:
+                    if stop_event.wait(timeout=node_drop_interval_sec):
+                        break
+
+        if dropped_so_far < node_drop_count:
+            print(f"[warning] Only dropped {dropped_so_far}/{node_drop_count} nodes — some may have already exited")
+    finally:
+        append_node_drop_log(node_drop_log, {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "run_label": run_label,
+            "summary": True,
+            "node_drop_count_configured": node_drop_count,
+            "node_drop_count_actual": dropped_so_far,
+            "num_nodes": num_nodes,
+            "node_drop_percent": node_drop_percent,
+        })
 
 
 def validate_args(
@@ -470,14 +475,6 @@ def run_one_simulation(
     if num_nodes - node_drop_count < committee_size:
         sys.exit(f"Error: node-drop percent leaves fewer than committee_size ({committee_size}) nodes alive")
 
-    # Total graph-generation pre-phase duration (protocol start offset + graph
-    # discovery + graph building rounds). Used for display; the absolute drop
-    # deadline is anchored to the protocol start_time once it is fixed below.
-    graph_phase_sec = (
-        PROTOCOL_START_OFFSET_SEC
-        + parse_duration(graph_discovery_timeout)
-        + graph_building_rounds * parse_duration(graph_building_round_timeout)
-    )
     # interval 0 = drop all configured nodes at once (batch) right after the graph
     # phase, so the configured node_drop_percent is actually realized even on short
     # runs; a positive interval spaces drops out for gradual-churn experiments.
@@ -506,7 +503,7 @@ def run_one_simulation(
     print(f"- Graph building round timeout: {graph_building_round_timeout}")
     print(f"- Log level: {log_level_status}")
     print(f"- Drop-on-send nodes: {drop_count} ({drop_on_send_percent:.2f}%)")
-    print(f"- Node-drop count: {node_drop_count} ({node_drop_percent:.2f}%), starting after graph phase ({graph_phase_sec}s), dropping {drop_mode_desc}")
+    print(f"- Node-drop count: {node_drop_count} ({node_drop_percent:.2f}%), dropping {drop_mode_desc} after graph phase")
     print("")
 
     # Start bootstrap server
@@ -635,7 +632,7 @@ def run_one_simulation(
     print(f"- Session ID: {session_id}")
     print(f"- Drop-on-send nodes: {drop_count} ({drop_on_send_percent:.2f}%)")
     print(f"- Peer-drop nodes: {peer_drop_count} ({peer_drop_percent:.2f}%)")
-    print(f"- Node-drop count: {node_drop_count} ({node_drop_percent:.2f}%), after {graph_phase_sec}s, dropping {drop_mode_desc}")
+    print(f"- Node-drop count: {node_drop_count} ({node_drop_percent:.2f}%), in ~{int(graph_phase_deadline - time.time())}s, dropping {drop_mode_desc}")
     print("- Discovery: DHT with bootstrap server")
     print(f"- Log files: {paths.logs_dir}/node-*.log")
     print(f"- Bootstrap log: {paths.bootstrap_log}")
@@ -806,6 +803,7 @@ def main() -> None:
         )
         node_drop_percent = float(run.get("node_drop_percent", args.node_drop_percent))
         node_drop_interval_sec = int(run.get("node_drop_interval_sec", args.node_drop_interval_sec))
+        peer_drop_percent = float(run.get("peer_drop_percent", 0.0))
         verify_timeout = str(run.get("verify_timeout", "30s"))
         committee_size = int(run.get("committee_size", 30))
         graph_discovery_timeout = run.get("graph_discovery_timeout")
@@ -855,6 +853,7 @@ def main() -> None:
             graph_discovery_timeout=graph_discovery_timeout,
             graph_building_round_timeout=graph_building_round_timeout,
             scenario_name=scenario_name,
+            peer_drop_percent=peer_drop_percent,
         )
 
         if idx < len(runs) and sleep_between > 0:
