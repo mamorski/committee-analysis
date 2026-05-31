@@ -10,9 +10,8 @@
             "metrics_push_percent": 20,
             "drop_on_send_percent": 5,
             "drop_on_send_probability": 0.2,
-            "kill_random_up_to": 10,
-            "kill_random_delay_sec": 10,
-            "kill_probability": 0.1,
+            "node_drop_percent": 10,
+            "node_drop_interval_sec": 0,
             "verify_timeout": "30s"
         },
         {
@@ -24,9 +23,8 @@
             "metrics_push_percent": 20,
             "drop_on_send_percent": 5,
             "drop_on_send_probability": 0.2,
-            "kill_random_up_to": 25,
-            "kill_random_delay_sec": 10,
-            "kill_probability": 0.1,
+            "node_drop_percent": 10,
+            "node_drop_interval_sec": 0,
             "verify_timeout": "30s"
         },
         {
@@ -38,9 +36,8 @@
             "metrics_push_percent": 10,
             "drop_on_send_percent": 5,
             "drop_on_send_probability": 0.2,
-            "kill_random_up_to": 50,
-            "kill_random_delay_sec": 10,
-            "kill_probability": 0.1,
+            "node_drop_percent": 10,
+            "node_drop_interval_sec": 0,
             "verify_timeout": "2m"
         },
         {
@@ -52,9 +49,8 @@
             "metrics_push_percent": 10,
             "drop_on_send_percent": 5,
             "drop_on_send_probability": 0.2,
-            "kill_random_up_to": 100,
-            "kill_random_delay_sec": 10,
-            "kill_probability": 0.1,
+            "node_drop_percent": 10,
+            "node_drop_interval_sec": 0,
             "verify_timeout": "3m"
         }
     ]

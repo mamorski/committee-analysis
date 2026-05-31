@@ -14,6 +14,8 @@
       "log_level": "info",
       "drop_on_send_percent": 0,
       "drop_on_send_probability": 0.0,
+      "node_drop_percent": 0,
+      "node_drop_interval_sec": 0,
       "metrics_enabled": false
     },
     {

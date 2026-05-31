@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import sys
 import tarfile
@@ -42,36 +43,106 @@ def percent_to_count(total: int, percent: float) -> int:
     return max(1, math.ceil(total * (percent / 100.0)))
 
 
+PROTOCOL_START_OFFSET_SEC = 60
+
+
 def _ensure_duration(value: Optional[str]) -> str:
     if not value:
         return "0s"
     return str(value)
 
 
-def kill_random_node(
-        procs: Processes,
+def parse_duration(duration: str) -> int:
+    """Parse a Go duration string into seconds. Handles compound forms like '2m30s', '1h5m'.
+
+    Note: 'ms' is matched before 'm' so '500ms' is not misread as 500 minutes.
+    """
+    duration = duration.strip()
+    matches = re.findall(r'(\d+)(ms|h|m|s)', duration)
+    if not matches:
+        return int(duration)
+    total = 0.0
+    for value, unit in matches:
+        if unit == 'h':
+            total += int(value) * 3600
+        elif unit == 'm':
+            total += int(value) * 60
+        elif unit == 's':
+            total += int(value)
+        elif unit == 'ms':
+            total += int(value) / 1000.0
+    return int(total)
+
+
+def append_node_drop_log(node_drop_log: Path, record: dict) -> None:
+    with node_drop_log.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def drop_nodes(
+        node_id_map: Dict[int, Popen],
         stop_event: threading.Event,
-        kill_random_up_to: int,
-        kill_random_delay_sec: int,
-        kill_probability: float,
+        graph_phase_deadline: float,
+        node_drop_count: int,
+        node_drop_interval_sec: int,
+        node_drop_log: Path,
+        session_id: str,
+        run_label: str,
+        num_nodes: int,
+        node_drop_percent: float,
+        logs_dir: Path,
 ) -> None:
-    if len(procs.node_procs) == 0:
+    if node_drop_count == 0:
         return
 
-    killed_procs = []
-    while not stop_event.is_set():
-        if random.random() < kill_probability:
-            while True:
-                random_node = random.choice(procs.node_procs)
-                if random_node.poll() is None and random_node not in killed_procs:
+    # Wait until graph generation completes before dropping anything. The deadline
+    # is anchored to the protocol start_time (an absolute epoch shared with the node
+    # configs), not to this thread's start, so the drop instant does not drift with
+    # however long node launch takes.
+    wait_sec = graph_phase_deadline - time.time()
+    if wait_sec > 0 and stop_event.wait(timeout=wait_sec):
+        return
+
+    candidates = list(node_id_map.items())
+    random.shuffle(candidates)
+    dropped_so_far = 0
+
+    for node_id, proc in candidates:
+        if stop_event.is_set() or dropped_so_far >= node_drop_count:
+            break
+
+        if proc.poll() is None:
+            proc.terminate()
+            dropped_so_far += 1
+            timestamp = datetime.now(timezone.utc).isoformat()
+            record = {
+                "timestamp": timestamp,
+                "session_id": session_id,
+                "run_label": run_label,
+                "node_id": node_id,
+                "node_log": str(logs_dir / f"node-{node_id}.log"),
+                "dropped_so_far": dropped_so_far,
+                "node_drop_count": node_drop_count,
+                "num_nodes": num_nodes,
+                "node_drop_percent": node_drop_percent,
+            }
+            append_node_drop_log(node_drop_log, record)
+            print(f"[{timestamp}] Dropped node-{node_id} ({dropped_so_far}/{node_drop_count})")
+
+            if dropped_so_far < node_drop_count:
+                if stop_event.wait(timeout=node_drop_interval_sec):
                     break
 
-            random_node.terminate()
-            killed_procs.append(random_node)
-
-        if len(killed_procs) >= kill_random_up_to:
-            return
-        time.sleep(kill_random_delay_sec)
+    append_node_drop_log(node_drop_log, {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id,
+        "run_label": run_label,
+        "summary": True,
+        "node_drop_count_configured": node_drop_count,
+        "node_drop_count_actual": dropped_so_far,
+        "num_nodes": num_nodes,
+        "node_drop_percent": node_drop_percent,
+    })
 
 
 def validate_args(
@@ -81,6 +152,8 @@ def validate_args(
         log_level: str,
         drop_on_send_percent: float,
         drop_on_send_probability: float,
+        node_drop_percent: float,
+        peer_drop_percent: float = 0.0,
 ) -> None:
     if num_nodes < 2:
         sys.exit("Error: Number of nodes must be a positive integer >= 2")
@@ -94,6 +167,10 @@ def validate_args(
         sys.exit("Error: drop-on-send percent must be within [0, 100]")
     if not 0.0 <= drop_on_send_probability <= 1.0:
         sys.exit("Error: drop-on-send probability must be within [0.0, 1.0]")
+    if not 0 <= node_drop_percent <= 100:
+        sys.exit("Error: node-drop percent must be within [0, 100]")
+    if not 0 <= peer_drop_percent <= 100:
+        sys.exit("Error: peer-drop percent must be within [0, 100]")
 
 
 def ensure_files(paths: Paths) -> None:
@@ -138,12 +215,14 @@ def write_committee_config(
         verify_timeout: str,
         graph_discovery_timeout: str,
         graph_building_round_timeout: str,
+        start_time: int,
         config_file_path: Optional[Path] = None,
         metrics_enabled: bool = False,
         pushgateway_enabled: bool = False,
         drop_on_send_enabled: bool = False,
         drop_on_send_probability: float = 0.0,
         committee_size: int = 30,
+        peer_drop_enabled: bool = False,
 ) -> Path:
     config_file = config_file_path or (
             paths.configs_dir / "committee-sampling-conf.json"
@@ -160,6 +239,7 @@ def write_committee_config(
             },
             "drop_on_send": drop_on_send_enabled,
             "drop_on_send_probability": drop_on_send_probability,
+            "peer_drop_enabled": peer_drop_enabled,
         },
         "graph": {
             "diameter": diameter,
@@ -180,7 +260,7 @@ def write_committee_config(
             "ex_ante_round_timeout": verify_timeout,
             "ex_post_round_timeout": verify_timeout,
             "mdag_round_timeout": "10s",
-            "start_time": int(time.time()) + 60,
+            "start_time": start_time,
             "graph_discovery_timeout": _ensure_duration(graph_discovery_timeout),
             "graph_building_round_timeout": _ensure_duration(graph_building_round_timeout),
             "time_server": "time.google.com",
@@ -322,15 +402,16 @@ def run_one_simulation(
         run_label: str,
         drop_on_send_percent: float,
         drop_on_send_probability: float,
-        kill_random_up_to: int,
-        kill_random_delay_sec: int,
-        kill_probability: float,
+        node_drop_percent: float,
+        node_drop_interval_sec: int,
+        node_drop_log: Path,
         verify_timeout: str = "30s",
         committee_size: int = 30,
         graph_building_rounds: int = 3,
         graph_discovery_timeout: str = "30s",
         graph_building_round_timeout: str = "2m",
         scenario_name: str = "",
+        peer_drop_percent: float = 0.0,
 ) -> None:
     validate_args(
         num_nodes,
@@ -339,6 +420,8 @@ def run_one_simulation(
         log_level,
         drop_on_send_percent,
         drop_on_send_probability,
+        node_drop_percent,
+        peer_drop_percent,
     )
 
     # Create per-run paths (logs in a dedicated folder; bootstrap log inside logs folder)
@@ -369,22 +452,39 @@ def run_one_simulation(
     # Trap signals to clean up
     procs = Processes(server_proc=None, node_procs=[])
     stop_event = threading.Event()
-    killer_thread = threading.Thread(
-        target=kill_random_node,
-        args=(
-            procs,
-            stop_event,
-            kill_random_up_to,
-            kill_random_delay_sec,
-            kill_probability,
-        ),
-        daemon=True,
-    )
 
     drop_count = percent_to_count(num_nodes, drop_on_send_percent)
     base_count = num_nodes - drop_count
     if base_count < 0:
         sys.exit("Error: configuration assigns more specialised nodes than available")
+
+    peer_drop_count = percent_to_count(num_nodes, peer_drop_percent)
+    # Space dropper indices evenly: every x-th node (1-indexed), not a contiguous block.
+    if peer_drop_count > 0:
+        x = max(1, num_nodes // peer_drop_count)
+        peer_drop_indices = {i * x + 1 for i in range(peer_drop_count)}
+    else:
+        peer_drop_indices: set = set()
+
+    node_drop_count = percent_to_count(num_nodes, node_drop_percent)
+    if num_nodes - node_drop_count < committee_size:
+        sys.exit(f"Error: node-drop percent leaves fewer than committee_size ({committee_size}) nodes alive")
+
+    # Total graph-generation pre-phase duration (protocol start offset + graph
+    # discovery + graph building rounds). Used for display; the absolute drop
+    # deadline is anchored to the protocol start_time once it is fixed below.
+    graph_phase_sec = (
+        PROTOCOL_START_OFFSET_SEC
+        + parse_duration(graph_discovery_timeout)
+        + graph_building_rounds * parse_duration(graph_building_round_timeout)
+    )
+    # interval 0 = drop all configured nodes at once (batch) right after the graph
+    # phase, so the configured node_drop_percent is actually realized even on short
+    # runs; a positive interval spaces drops out for gradual-churn experiments.
+    effective_interval = max(0, node_drop_interval_sec)
+    drop_mode_desc = "all at once (batch)" if effective_interval == 0 else f"every {effective_interval}s"
+
+    node_id_map: Dict[int, Popen] = {}
 
     def _handle_signal(_, __):
         stop_event.set()
@@ -406,6 +506,7 @@ def run_one_simulation(
     print(f"- Graph building round timeout: {graph_building_round_timeout}")
     print(f"- Log level: {log_level_status}")
     print(f"- Drop-on-send nodes: {drop_count} ({drop_on_send_percent:.2f}%)")
+    print(f"- Node-drop count: {node_drop_count} ({node_drop_percent:.2f}%), starting after graph phase ({graph_phase_sec}s), dropping {drop_mode_desc}")
     print("")
 
     # Start bootstrap server
@@ -415,20 +516,54 @@ def run_one_simulation(
     # Read bootstrap address
     bootstrap_address = read_bootstrap_address(paths)
 
-    # Create configuration(s) only for distinct settings and reuse them
+    # Fix one protocol start time, shared by every node's config (so all nodes run
+    # on a single clock) and by the drop thread. +OFFSET gives nodes time to boot
+    # and discover before the protocol begins.
+    protocol_start_time = int(time.time()) + PROTOCOL_START_OFFSET_SEC
+    # Absolute epoch at which graph generation ends, anchored to protocol_start_time
+    # so the drop fires at the same protocol-relative instant regardless of how long
+    # node launch takes (matters at 500-1000 nodes, where launch is many seconds).
+    graph_phase_deadline = (
+        protocol_start_time
+        + parse_duration(graph_discovery_timeout)
+        + graph_building_rounds * parse_duration(graph_building_round_timeout)
+    )
+
+    drop_thread = threading.Thread(
+        target=drop_nodes,
+        args=(
+            node_id_map,
+            stop_event,
+            graph_phase_deadline,
+            node_drop_count,
+            effective_interval,
+            node_drop_log,
+            session_id,
+            run_label,
+            num_nodes,
+            node_drop_percent,
+            logs_dir,
+        ),
+        daemon=True,
+    )
+
+    # Create configuration(s) only for distinct (drop_on_send, peer_drop) flag combinations
+    # and reuse them across nodes that share the same settings.
     print("")
     print("Starting nodes...")
 
-    config_cache: Dict[bool, Path] = {}
-    suffix_map: Dict[bool, str] = {
-        False: "base",
-        True: "drop",
-    }
+    config_cache: Dict[Tuple[bool, bool], Path] = {}
 
-    def ensure_config(drop_enabled: bool) -> Path:
-        if drop_enabled in config_cache:
-            return config_cache[drop_enabled]
-        suffix = suffix_map[drop_enabled]
+    def ensure_config(drop_on_send_flag: bool, peer_drop_flag: bool) -> Path:
+        key = (drop_on_send_flag, peer_drop_flag)
+        if key in config_cache:
+            return config_cache[key]
+        parts = []
+        if drop_on_send_flag:
+            parts.append("msgsend")
+        if peer_drop_flag:
+            parts.append("peerdrop")
+        suffix = "-".join(parts) if parts else "base"
         conf_path = paths.configs_dir / f"committee-sampling-conf-{run_label}-{suffix}.json"
         write_committee_config(
             paths,
@@ -442,32 +577,51 @@ def run_one_simulation(
             config_file_path=conf_path,
             metrics_enabled=False,
             pushgateway_enabled=False,
-            drop_on_send_enabled=drop_enabled,
-            drop_on_send_probability=drop_on_send_probability if drop_enabled else 0.0,
+            drop_on_send_enabled=drop_on_send_flag,
+            drop_on_send_probability=drop_on_send_probability if drop_on_send_flag else 0.0,
             verify_timeout=verify_timeout,
             graph_discovery_timeout=graph_discovery_timeout,
             graph_building_round_timeout=graph_building_round_timeout,
+            start_time=protocol_start_time,
             committee_size=committee_size,
+            peer_drop_enabled=peer_drop_flag,
         )
-        config_cache[drop_enabled] = conf_path
+        config_cache[key] = conf_path
         return conf_path
 
+    # Assign configs by iterating every node index so peer-drop nodes are spaced
+    # evenly (every x-th index) rather than grouped at the front.
+    # drop_on_send is applied to the first drop_count nodes (existing behaviour).
+    drop_on_send_indices = set(range(1, drop_count + 1))
     config_sequence: List[Path] = []
-    if drop_count > 0:
-        cfg = ensure_config(True)
-        config_sequence.extend([cfg] * drop_count)
-    if base_count > 0:
-        cfg = ensure_config(False)
-        config_sequence.extend([cfg] * base_count)
+    for idx in range(1, num_nodes + 1):
+        msg_drop = idx in drop_on_send_indices
+        peer_drop = idx in peer_drop_indices
+        config_sequence.append(ensure_config(msg_drop, peer_drop))
 
     if len(config_sequence) != num_nodes:
         sys.exit("Error: internal configuration mismatch while assigning node configs")
 
+    # Log peer-drop dropper indices before starting nodes
+    if peer_drop_count > 0:
+        peer_drop_log = paths.logs_dir / "peer_drops.log"
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        append_node_drop_log(peer_drop_log, {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "run_label": run_label,
+            "peer_drop_count": peer_drop_count,
+            "peer_drop_percent": peer_drop_percent,
+            "num_nodes": num_nodes,
+            "dropper_indices": sorted(peer_drop_indices),
+        })
+
     for idx, cfg_path in enumerate(config_sequence, start=1):
         proc = start_node(paths, idx, cfg_path)
         procs.node_procs.append(proc)
+        node_id_map[idx] = proc
 
-    killer_thread.start()
+    drop_thread.start()
 
     print("")
     print(f"All {num_nodes} nodes started successfully!")
@@ -480,6 +634,8 @@ def run_one_simulation(
     print("- Ports: Auto-assigned by system (port 0 configured)")
     print(f"- Session ID: {session_id}")
     print(f"- Drop-on-send nodes: {drop_count} ({drop_on_send_percent:.2f}%)")
+    print(f"- Peer-drop nodes: {peer_drop_count} ({peer_drop_percent:.2f}%)")
+    print(f"- Node-drop count: {node_drop_count} ({node_drop_percent:.2f}%), after {graph_phase_sec}s, dropping {drop_mode_desc}")
     print("- Discovery: DHT with bootstrap server")
     print(f"- Log files: {paths.logs_dir}/node-*.log")
     print(f"- Bootstrap log: {paths.bootstrap_log}")
@@ -516,14 +672,20 @@ def run_one_simulation(
             if running_count == 0:
                 print(
                     time.strftime("%H:%M:%S"),
-                    "- All nodes have stopped. Waiting 30 seconds to confirm completion...",
+                    "- All node processes have stopped. Waiting 30 seconds to confirm completion...",
                 )
                 print("")
-                print("🎉 All committee-sampling nodes have completed successfully!")
+                if node_drop_count > 0:
+                    print(f"🎉 Simulation finished (up to {node_drop_count} of {num_nodes} nodes dropped by the adversarial model).")
+                else:
+                    print("🎉 All committee-sampling nodes have completed successfully!")
                 print(f"Simulation finished at: {datetime.now()}")
                 print("")
                 break
             time.sleep(30)
+
+    stop_event.set()
+    drop_thread.join(timeout=5)
 
     print("Cleaning up and creating log archive...")
     cleanup(paths, procs, session_id)
@@ -578,25 +740,25 @@ def main() -> None:
         help="Number of graph building rounds to execute (must be even, default: 4)",
     )
     parser.add_argument(
-        "--kill-random-up-to",
-        dest="kill_random_up_to",
-        type=int,
-        default=0,
-        help="If >0, randomly terminate up to this many node processes per run (default: 0 = disabled)",
-    )
-    parser.add_argument(
-        "--kill-random-delay-sec",
-        dest="kill_random_delay_sec",
-        type=int,
-        default=0,
-        help="Seconds to wait before performing random kills (default: 0)",
-    )
-    parser.add_argument(
-        "--kill-probability",
-        dest="kill_probability",
+        "--node-drop-percent",
+        dest="node_drop_percent",
         type=float,
-        default=0.1,
-        help="Probability [0-1] used when killing a node (default: 0.1)",
+        default=0.0,
+        help="Percentage [0-100] of nodes to terminate after graph generation (default: 0 = disabled)",
+    )
+    parser.add_argument(
+        "--node-drop-interval-sec",
+        dest="node_drop_interval_sec",
+        type=int,
+        default=0,
+        help="Seconds between successive node drops; 0 = drop all configured nodes at once right after graph generation (default: 0)",
+    )
+    parser.add_argument(
+        "--node-drop-log",
+        dest="node_drop_log",
+        type=str,
+        default="",
+        help="Path to the persistent node-drop log file (default: <base_dir>/node_drops.log)",
     )
 
     args = parser.parse_args()
@@ -642,11 +804,8 @@ def main() -> None:
         drop_on_send_probability = float(
             run.get("drop_on_send_probability", args.drop_on_send_probability)
         )
-        kill_random_up_to = int(run.get("kill_random_up_to", args.kill_random_up_to))
-        kill_random_delay_sec = int(
-            run.get("kill_random_delay_sec", args.kill_random_delay_sec)
-        )
-        kill_probability = float(run.get("kill_probability", args.kill_probability))
+        node_drop_percent = float(run.get("node_drop_percent", args.node_drop_percent))
+        node_drop_interval_sec = int(run.get("node_drop_interval_sec", args.node_drop_interval_sec))
         verify_timeout = str(run.get("verify_timeout", "30s"))
         committee_size = int(run.get("committee_size", 30))
         graph_discovery_timeout = run.get("graph_discovery_timeout")
@@ -675,6 +834,8 @@ def main() -> None:
 
         scenario_name = run.get("name", "")
         
+        node_drop_log = Path(args.node_drop_log) if args.node_drop_log else base_dir / "node_drops.log"
+
         run_label = f"run-{idx:02d}-{num_nodes}n-{max_deg}m-d{diameter}"
         run_one_simulation(
             base_paths,
@@ -685,9 +846,9 @@ def main() -> None:
             run_label=run_label,
             drop_on_send_percent=drop_on_send_percent,
             drop_on_send_probability=drop_on_send_probability,
-            kill_random_up_to=kill_random_up_to,
-            kill_random_delay_sec=kill_random_delay_sec,
-            kill_probability=kill_probability,
+            node_drop_percent=node_drop_percent,
+            node_drop_interval_sec=node_drop_interval_sec,
+            node_drop_log=node_drop_log,
             verify_timeout=verify_timeout,
             committee_size=committee_size,
             graph_building_rounds=graph_building_rounds,
