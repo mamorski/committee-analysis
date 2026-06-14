@@ -23,18 +23,41 @@ from tqdm import tqdm
 class Paths:
     base_dir: Path
     bin_dir: Path
-    logs_dir: Path
     configs_dir: Path
-    pids_file: Path
-    bootstrap_log: Path
-    bootstrap_pid_file: Path
     bootstrap_address_file: Path
+    # Set only on the per-run Paths; left None on the shared base_paths.
+    logs_dir: Optional[Path] = None
+    pids_file: Optional[Path] = None
+    bootstrap_log: Optional[Path] = None
+    bootstrap_pid_file: Optional[Path] = None
 
 
 @dataclass
 class Processes:
     server_proc: Optional[Popen]
     node_procs: List[Popen]
+
+
+@dataclass
+class RunConfig:
+    """Fully-resolved settings for a single simulation run (one entry of a batch)."""
+    num_nodes: int
+    max_outbound_degree: int
+    diameter: int
+    log_level: str
+    run_label: str
+    drop_on_send_percent: float
+    drop_on_send_probability: float
+    node_drop_percent: float
+    node_drop_interval_sec: int
+    node_drop_log: Path
+    verify_timeout: str
+    committee_size: int
+    graph_building_rounds: int
+    graph_discovery_timeout: str
+    graph_building_round_timeout: str
+    scenario_name: str
+    peer_drop_percent: float
 
 
 def percent_to_count(total: int, percent: float) -> int:
@@ -44,6 +67,14 @@ def percent_to_count(total: int, percent: float) -> int:
 
 
 PROTOCOL_START_OFFSET_SEC = 60
+
+
+def _swallow(fn, *args, **kwargs) -> None:
+    """Call fn, ignoring any exception. Used for best-effort cleanup steps."""
+    try:
+        fn(*args, **kwargs)
+    except Exception:
+        pass
 
 
 def _ensure_duration(value: Optional[str]) -> str:
@@ -343,7 +374,6 @@ def backup_logs(paths: Paths, session_id: str) -> Path:
     return archive_path
 
 
-# noinspection PyBroadException
 def cleanup(paths: Paths, procs: Processes, session_id: str) -> None:
     print("")
     print("Stopping all nodes...")
@@ -351,73 +381,53 @@ def cleanup(paths: Paths, procs: Processes, session_id: str) -> None:
     # Stop node processes
     for p in procs.node_procs:
         if p.poll() is None:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+            _swallow(p.terminate)
 
     # Stop bootstrap server
     if paths.bootstrap_pid_file.is_file():
-        try:
+        def _kill_bootstrap():
             boot_pid_str = paths.bootstrap_pid_file.read_text().strip()
             if boot_pid_str:
                 os.kill(int(boot_pid_str), signal.SIGTERM)
-        except Exception:
-            pass
-        try:
-            paths.bootstrap_pid_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _swallow(_kill_bootstrap)
+        _swallow(paths.bootstrap_pid_file.unlink, missing_ok=True)
 
     # Backup logs only
     archive_path = backup_logs(paths, session_id)
 
     # Clean up temporary logs (but keep configs as requested in bash script)
     print("Cleaning up temporary logs...")
-    try:
-        rmtree(paths.logs_dir, ignore_errors=True)
-    except Exception:
-        pass
-    try:
-        paths.pids_file.unlink(missing_ok=True)
-    except Exception:
-        pass
-    try:
-        paths.bootstrap_address_file.unlink(missing_ok=True)
-    except Exception:
-        pass
+    _swallow(rmtree, paths.logs_dir, ignore_errors=True)
+    _swallow(paths.pids_file.unlink, missing_ok=True)
+    _swallow(paths.bootstrap_address_file.unlink, missing_ok=True)
 
     print("Cleaning up temporary configs...")
-    try:
-        rmtree(paths.configs_dir, ignore_errors=True)
-    except Exception:
-        pass
+    _swallow(rmtree, paths.configs_dir, ignore_errors=True)
 
     print("All nodes and bootstrap server stopped")
     print(f"Logs archived: {archive_path}")
     print("Configuration files removed")
 
 
-def run_one_simulation(
-        base_paths: Paths,
-        num_nodes: int,
-        max_outbound_degree: int,
-        diameter: int,
-        log_level: str,
-        run_label: str,
-        drop_on_send_percent: float,
-        drop_on_send_probability: float,
-        node_drop_percent: float,
-        node_drop_interval_sec: int,
-        node_drop_log: Path,
-        verify_timeout: str = "30s",
-        committee_size: int = 30,
-        graph_building_rounds: int = 3,
-        graph_discovery_timeout: str = "30s",
-        graph_building_round_timeout: str = "2m",
-        scenario_name: str = "",
-        peer_drop_percent: float = 0.0,
-) -> None:
+def run_one_simulation(base_paths: Paths, cfg: RunConfig) -> None:
+    num_nodes = cfg.num_nodes
+    max_outbound_degree = cfg.max_outbound_degree
+    diameter = cfg.diameter
+    log_level = cfg.log_level
+    run_label = cfg.run_label
+    drop_on_send_percent = cfg.drop_on_send_percent
+    drop_on_send_probability = cfg.drop_on_send_probability
+    node_drop_percent = cfg.node_drop_percent
+    node_drop_interval_sec = cfg.node_drop_interval_sec
+    node_drop_log = cfg.node_drop_log
+    verify_timeout = cfg.verify_timeout
+    committee_size = cfg.committee_size
+    graph_building_rounds = cfg.graph_building_rounds
+    graph_discovery_timeout = cfg.graph_discovery_timeout
+    graph_building_round_timeout = cfg.graph_building_round_timeout
+    scenario_name = cfg.scenario_name
+    peer_drop_percent = cfg.peer_drop_percent
+
     validate_args(
         num_nodes,
         max_outbound_degree,
@@ -688,6 +698,136 @@ def run_one_simulation(
     cleanup(paths, procs, session_id)
 
 
+def _expand_sweep(sweep: dict) -> List[dict]:
+    """Expand a sweep block into a flat list of run dicts."""
+    nn_spec = sweep.get("num_nodes")
+    if not isinstance(nn_spec, dict) or not all(k in nn_spec for k in ("from", "to", "step")):
+        sys.exit("Error: sweep.num_nodes must have 'from', 'to', and 'step' keys")
+    n_from, n_to, n_step = int(nn_spec["from"]), int(nn_spec["to"]), int(nn_spec["step"])
+    if n_step <= 0:
+        sys.exit("Error: sweep.num_nodes.step must be > 0")
+    repetitions = int(sweep.get("repetitions", 1))
+    if repetitions < 1:
+        sys.exit("Error: sweep.repetitions must be >= 1")
+
+    template = {k: v for k, v in sweep.items() if k not in ("num_nodes", "repetitions")}
+
+    if "max_outbound_degree" not in template and "max_degree" not in template:
+        sys.exit("Error: sweep must include 'max_outbound_degree'")
+    if "diameter" not in template:
+        sys.exit("Error: sweep must include 'diameter'")
+
+    runs: List[dict] = []
+    n = n_from
+    while n <= n_to:
+        for r in range(1, repetitions + 1):
+            entry = dict(template)
+            entry["number_of_nodes"] = n
+            entry["name"] = f"sweep-{n}n-rep-{r:02d}"
+            runs.append(entry)
+        n += n_step
+    return runs
+
+
+def _expand_runs(batch_cfg: dict) -> List[dict]:
+    """Return flat run list, expanding sweep or inline repetitions."""
+    if "sweep" in batch_cfg:
+        runs = _expand_sweep(batch_cfg["sweep"])
+    else:
+        runs = batch_cfg.get("runs")
+        if not isinstance(runs, list) or not runs:
+            sys.exit("Error: batch config must contain a non-empty 'runs' array or a 'sweep' block")
+
+    expanded: List[dict] = []
+    for run in runs:
+        reps = int(run.get("repetitions", 1))
+        if reps < 1:
+            sys.exit(f"Error: run '{run.get('name', '?')}' has repetitions < 1")
+        if reps == 1:
+            expanded.append(run)
+        else:
+            base_name = run.get("name", "run")
+            for r in range(1, reps + 1):
+                entry = dict(run)
+                entry.pop("repetitions", None)
+                entry["name"] = f"{base_name}-rep-{r:02d}"
+                expanded.append(entry)
+    return expanded
+
+
+def parse_run(run: dict, args: argparse.Namespace, idx: int, base_dir: Path) -> RunConfig:
+    """Resolve one batch run dict (with CLI defaults and field-name aliases) into a RunConfig.
+
+    Precedence is intentionally non-uniform and must be preserved:
+    - timeout fields use truthiness fallback (an empty string falls through to the next source);
+    - graph_building_rounds uses an explicit `is None` check so a configured 0 is kept.
+    """
+    # Flexible field names
+    num_nodes = run.get("number_of_nodes", run.get("num_nodes"))
+    max_deg = run.get("max_outbound_degree", run.get("max_degree"))
+    diameter = run.get("diameter")
+    log_level = run.get("log_level", args.default_log_level)
+    drop_on_send_percent = float(
+        run.get("drop_on_send_percent", args.drop_on_send_percent)
+    )
+    drop_on_send_probability = float(
+        run.get("drop_on_send_probability", args.drop_on_send_probability)
+    )
+    node_drop_percent = float(run.get("node_drop_percent", args.node_drop_percent))
+    node_drop_interval_sec = int(run.get("node_drop_interval_sec", args.node_drop_interval_sec))
+    peer_drop_percent = float(run.get("peer_drop_percent", 0.0))
+    verify_timeout = str(run.get("verify_timeout", "30s"))
+    committee_size = int(run.get("committee_size", 30))
+
+    graph_discovery_timeout = run.get("graph_discovery_timeout")
+    if not graph_discovery_timeout:
+        graph_discovery_timeout = args.graph_discovery_timeout
+    graph_discovery_timeout = str(graph_discovery_timeout)
+
+    graph_building_round_timeout = run.get("graph_building_round_timeout")
+    if not graph_building_round_timeout:
+        graph_building_round_timeout = run.get("building_graph_timeout")
+    if not graph_building_round_timeout:
+        graph_building_round_timeout = args.graph_building_round_timeout
+    graph_building_round_timeout = str(graph_building_round_timeout)
+
+    graph_building_rounds = run.get("graph_building_rounds")
+    if graph_building_rounds is None:
+        graph_building_rounds = run.get("building_rounds")
+    if graph_building_rounds is None:
+        graph_building_rounds = args.graph_building_rounds
+    graph_building_rounds = int(graph_building_rounds)
+
+    if num_nodes is None or max_deg is None or diameter is None:
+        sys.exit(
+            f"Error: run #{idx} must include 'number_of_nodes' (or 'num_nodes'), 'max_outbound_degree' (or 'max_degree'), and 'diameter'"
+        )
+
+    scenario_name = run.get("name", "")
+    node_drop_log = Path(args.node_drop_log) if args.node_drop_log else base_dir / "node_drops.log"
+    run_label = f"run-{idx:02d}-{num_nodes}n-{max_deg}m-d{diameter}"
+
+    return RunConfig(
+        num_nodes=int(num_nodes),
+        max_outbound_degree=int(max_deg),
+        diameter=int(diameter),
+        log_level=str(log_level),
+        run_label=run_label,
+        drop_on_send_percent=drop_on_send_percent,
+        drop_on_send_probability=drop_on_send_probability,
+        node_drop_percent=node_drop_percent,
+        node_drop_interval_sec=node_drop_interval_sec,
+        node_drop_log=node_drop_log,
+        verify_timeout=verify_timeout,
+        committee_size=committee_size,
+        graph_building_rounds=graph_building_rounds,
+        graph_discovery_timeout=graph_discovery_timeout,
+        graph_building_round_timeout=graph_building_round_timeout,
+        scenario_name=scenario_name,
+        peer_drop_percent=peer_drop_percent,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run committee-sampling simulations from a JSON config file"
@@ -761,17 +901,12 @@ def main() -> None:
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
+    # Only the shared fields are set here; logs_dir, pids_file, bootstrap_log and
+    # bootstrap_pid_file are derived per-run inside run_one_simulation.
     base_paths = Paths(
         base_dir=base_dir,
         bin_dir=base_dir / "bin",
-        logs_dir=base_dir / "logs",  # base logs dir; per-run subdir created later
         configs_dir=base_dir / "configs",
-        pids_file=base_dir
-                  / "node_pids.txt",  # unused in batch; per-run file created later
-        bootstrap_log=base_dir
-                      / "bootstrap.log",  # unused in batch; per-run file created later
-        bootstrap_pid_file=base_dir
-                           / "bootstrap_pid.txt",  # unused in batch; per-run file created later
         bootstrap_address_file=base_dir / "bootstrap_address.txt",
     )
 
@@ -784,77 +919,14 @@ def main() -> None:
         except json.JSONDecodeError as e:
             sys.exit(f"Error: failed to parse JSON: {e}")
 
-    runs = batch_cfg.get("runs")
-    if not isinstance(runs, list) or not runs:
-        sys.exit("Error: batch config must contain a non-empty 'runs' array")
+    runs = _expand_runs(batch_cfg)
+    if not runs:
+        sys.exit("Error: batch config produced zero runs")
     sleep_between = int(batch_cfg.get("sleep_between_runs_sec", 0) or 0)
 
     for idx, run in enumerate(runs, start=1):
-        # Flexible field names
-        num_nodes = run.get("number_of_nodes", run.get("num_nodes"))
-        max_deg = run.get("max_outbound_degree", run.get("max_degree"))
-        diameter = run.get("diameter")
-        log_level = run.get("log_level", args.default_log_level)
-        drop_on_send_percent = float(
-            run.get("drop_on_send_percent", args.drop_on_send_percent)
-        )
-        drop_on_send_probability = float(
-            run.get("drop_on_send_probability", args.drop_on_send_probability)
-        )
-        node_drop_percent = float(run.get("node_drop_percent", args.node_drop_percent))
-        node_drop_interval_sec = int(run.get("node_drop_interval_sec", args.node_drop_interval_sec))
-        peer_drop_percent = float(run.get("peer_drop_percent", 0.0))
-        verify_timeout = str(run.get("verify_timeout", "30s"))
-        committee_size = int(run.get("committee_size", 30))
-        graph_discovery_timeout = run.get("graph_discovery_timeout")
-        if not graph_discovery_timeout:
-            graph_discovery_timeout = args.graph_discovery_timeout
-        graph_discovery_timeout = str(graph_discovery_timeout)
-
-        graph_building_round_timeout = run.get("graph_building_round_timeout")
-        if not graph_building_round_timeout:
-            graph_building_round_timeout = run.get("building_graph_timeout")
-        if not graph_building_round_timeout:
-            graph_building_round_timeout = args.graph_building_round_timeout
-        graph_building_round_timeout = str(graph_building_round_timeout)
-
-        graph_building_rounds = run.get("graph_building_rounds")
-        if graph_building_rounds is None:
-            graph_building_rounds = run.get("building_rounds")
-        if graph_building_rounds is None:
-            graph_building_rounds = args.graph_building_rounds
-        graph_building_rounds = int(graph_building_rounds)
-
-        if num_nodes is None or max_deg is None or diameter is None:
-            sys.exit(
-                f"Error: run #{idx} must include 'number_of_nodes' (or 'num_nodes'), 'max_outbound_degree' (or 'max_degree'), and 'diameter'"
-            )
-
-        scenario_name = run.get("name", "")
-        
-        node_drop_log = Path(args.node_drop_log) if args.node_drop_log else base_dir / "node_drops.log"
-
-        run_label = f"run-{idx:02d}-{num_nodes}n-{max_deg}m-d{diameter}"
-        run_one_simulation(
-            base_paths,
-            num_nodes=int(num_nodes),
-            max_outbound_degree=int(max_deg),
-            diameter=int(diameter),
-            log_level=str(log_level),
-            run_label=run_label,
-            drop_on_send_percent=drop_on_send_percent,
-            drop_on_send_probability=drop_on_send_probability,
-            node_drop_percent=node_drop_percent,
-            node_drop_interval_sec=node_drop_interval_sec,
-            node_drop_log=node_drop_log,
-            verify_timeout=verify_timeout,
-            committee_size=committee_size,
-            graph_building_rounds=graph_building_rounds,
-            graph_discovery_timeout=graph_discovery_timeout,
-            graph_building_round_timeout=graph_building_round_timeout,
-            scenario_name=scenario_name,
-            peer_drop_percent=peer_drop_percent,
-        )
+        cfg = parse_run(run, args, idx, base_dir)
+        run_one_simulation(base_paths, cfg)
 
         if idx < len(runs) and sleep_between > 0:
             print(f"Sleeping {sleep_between}s before the next run...")
