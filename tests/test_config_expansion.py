@@ -1,6 +1,6 @@
 import pytest
 
-from run_simulations import _expand_runs, _expand_sweep, parse_run
+from committee_sim.run_simulations import _expand_runs, _expand_sweep, parse_run
 
 
 class TestExpandSweep:

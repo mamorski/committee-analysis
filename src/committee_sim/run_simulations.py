@@ -4,19 +4,23 @@ import math
 import os
 import random
 import re
+import shutil
 import signal
 import sys
 import tarfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 from shutil import rmtree
 from subprocess import Popen, STDOUT
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from tqdm import tqdm
+
+from .telegram_notifier import Notifier, StopFlags, free_bytes
 
 
 @dataclass
@@ -60,6 +64,18 @@ class RunConfig:
     peer_drop_percent: float
 
 
+@dataclass
+class SimResult:
+    """Outcome of a single run, returned by run_one_simulation for main()."""
+    outcome: str            # "completed" | "killed"
+    session_id: str
+    run_label: str
+    num_nodes: int
+    duration_sec: float
+    node_drop_count: int
+    archive: Optional[str]  # archive path (completed) or None (killed)
+
+
 def percent_to_count(total: int, percent: float) -> int:
     if percent <= 0 or total <= 0:
         return 0
@@ -67,6 +83,84 @@ def percent_to_count(total: int, percent: float) -> int:
 
 
 PROTOCOL_START_OFFSET_SEC = 60
+
+# --- Nightly run window (Israel time) -------------------------------------
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+WINDOW_START_HOUR = 0   # 00:00 — crontab starts the script
+WINDOW_END_HOUR = 8     # 08:00 — script must have exited by here
+MIN_SLACK_MIN = 30      # don't start a new sim with less than this before the window end
+MIN_FREE_BYTES = 7 * 1024 ** 3  # require >= 7 GB free before starting a sim
+DISK_POLL_SEC = 5 * 60  # re-check disk every 5 min while waiting for space
+
+
+def israel_now(now: Optional[float] = None) -> datetime:
+    """Current (or supplied) instant as an aware datetime in Israel time."""
+    ts = time.time() if now is None else now
+    return datetime.fromtimestamp(ts, ISRAEL_TZ)
+
+
+def window_end_epoch(now: Optional[float] = None) -> float:
+    """Epoch seconds of today's WINDOW_END_HOUR (08:00) in Israel time.
+
+    DST-correct: the wall-clock 08:00 is resolved through Asia/Jerusalem, so the
+    returned epoch shifts by an hour between winter (UTC+2) and summer (UTC+3).
+    """
+    local = israel_now(now)
+    end_local = datetime.combine(local.date(), dtime(hour=WINDOW_END_HOUR), tzinfo=ISRAEL_TZ)
+    return end_local.timestamp()
+
+
+def in_window(now: Optional[float] = None) -> bool:
+    """True if the current Israel-local hour is within [START, END)."""
+    hour = israel_now(now).hour
+    return WINDOW_START_HOUR <= hour < WINDOW_END_HOUR
+
+
+def seconds_to_window_end(now: Optional[float] = None) -> float:
+    ts = time.time() if now is None else now
+    return window_end_epoch(now) - ts
+
+
+def enough_slack(now: Optional[float] = None) -> bool:
+    """True if there is at least MIN_SLACK_MIN before the window end."""
+    return seconds_to_window_end(now) >= MIN_SLACK_MIN * 60
+
+
+# --- Run-state log (resume support) ---------------------------------------
+def load_finished_labels(state_log: Path) -> set:
+    """Return the set of run_labels recorded as fully finished.
+
+    Tolerant of malformed/partial lines (e.g. a crash mid-write): such lines are
+    skipped rather than fatal. Missing file -> empty set.
+    """
+    finished: set = set()
+    if not state_log.is_file():
+        return finished
+    for line in state_log.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        label = rec.get("run_label")
+        if label:
+            finished.add(label)
+    return finished
+
+
+def record_finished(state_log: Path, run_label: str, session_id: str, archive: str) -> None:
+    """Append one JSON line marking a sim as fully finished (post-archive)."""
+    state_log.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "run_label": run_label,
+        "session_id": session_id,
+        "archive": archive,
+    }
+    with state_log.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def _swallow(fn, *args, **kwargs) -> None:
@@ -374,26 +468,47 @@ def backup_logs(paths: Paths, session_id: str) -> Path:
     return archive_path
 
 
-def cleanup(paths: Paths, procs: Processes, session_id: str) -> None:
+def cleanup(
+    paths: Paths,
+    procs: Processes,
+    session_id: str,
+    archive: bool = True,
+    force: bool = False,
+) -> Optional[Path]:
+    """Stop everything and clean up a run's transient files.
+
+    ``archive=True``  -> tar node logs to ``{session_id}.tar.gz`` before deleting
+    (normal completion). ``archive=False`` -> skip archiving and delete any partial
+    ``{session_id}.tar.gz`` that exists (hard-kill at deadline / ``/stop now``).
+    ``force=True`` SIGKILLs node + bootstrap processes instead of a graceful
+    terminate/SIGTERM. Returns the archive path on success, else None.
+    """
     print("")
-    print("Stopping all nodes...")
+    print("Stopping all nodes..." if not force else "Killing all nodes...")
 
     # Stop node processes
     for p in procs.node_procs:
         if p.poll() is None:
-            _swallow(p.terminate)
+            _swallow(p.kill if force else p.terminate)
 
     # Stop bootstrap server
     if paths.bootstrap_pid_file.is_file():
+        boot_sig = signal.SIGKILL if force else signal.SIGTERM
+
         def _kill_bootstrap():
             boot_pid_str = paths.bootstrap_pid_file.read_text().strip()
             if boot_pid_str:
-                os.kill(int(boot_pid_str), signal.SIGTERM)
+                os.kill(int(boot_pid_str), boot_sig)
         _swallow(_kill_bootstrap)
         _swallow(paths.bootstrap_pid_file.unlink, missing_ok=True)
 
-    # Backup logs only
-    archive_path = backup_logs(paths, session_id)
+    archive_path: Optional[Path] = None
+    if archive:
+        # Backup logs only
+        archive_path = backup_logs(paths, session_id)
+    else:
+        # Hard-kill: drop any partial archive left from an interrupted run.
+        _swallow((paths.base_dir / f"{session_id}.tar.gz").unlink, missing_ok=True)
 
     # Clean up temporary logs (but keep configs as requested in bash script)
     print("Cleaning up temporary logs...")
@@ -405,11 +520,20 @@ def cleanup(paths: Paths, procs: Processes, session_id: str) -> None:
     _swallow(rmtree, paths.configs_dir, ignore_errors=True)
 
     print("All nodes and bootstrap server stopped")
-    print(f"Logs archived: {archive_path}")
+    if archive_path is not None:
+        print(f"Logs archived: {archive_path}")
+    else:
+        print("Logs discarded (hard stop)")
     print("Configuration files removed")
+    return archive_path
 
 
-def run_one_simulation(base_paths: Paths, cfg: RunConfig) -> None:
+def run_one_simulation(
+    base_paths: Paths,
+    cfg: RunConfig,
+    deadline_epoch: Optional[float] = None,
+    stop_flags: Optional[StopFlags] = None,
+) -> SimResult:
     num_nodes = cfg.num_nodes
     max_outbound_degree = cfg.max_outbound_degree
     diameter = cfg.diameter
@@ -427,6 +551,10 @@ def run_one_simulation(base_paths: Paths, cfg: RunConfig) -> None:
     graph_building_round_timeout = cfg.graph_building_round_timeout
     scenario_name = cfg.scenario_name
     peer_drop_percent = cfg.peer_drop_percent
+
+    sim_start = time.time()
+    if stop_flags is None:
+        stop_flags = StopFlags()
 
     validate_args(
         num_nodes,
@@ -665,8 +793,14 @@ def run_one_simulation(base_paths: Paths, cfg: RunConfig) -> None:
     )
     print("")
 
+    # Poll every POLL_STEP seconds (was a blind 30s sleep). Waking more often lets
+    # us react promptly to the 08:00 deadline or a /stop now without waiting out a
+    # full 30s window mid-sleep.
+    POLL_STEP = 5
     completed = 0
     total = len(procs.node_procs)
+    hard_stop = False
+    hard_stop_reason = ""
     with tqdm(total=total, desc="Completed nodes") as pbar:
         while True:
             running_count = sum(1 for p in procs.node_procs if p.poll() is None)
@@ -689,13 +823,47 @@ def run_one_simulation(base_paths: Paths, cfg: RunConfig) -> None:
                 print(f"Simulation finished at: {datetime.now()}")
                 print("")
                 break
-            time.sleep(30)
+
+            if deadline_epoch is not None and time.time() >= deadline_epoch:
+                hard_stop = True
+                hard_stop_reason = "08:00 window deadline reached"
+                break
+            if stop_flags.stop_immediate.is_set():
+                hard_stop = True
+                hard_stop_reason = "/stop now received"
+                break
+
+            time.sleep(POLL_STEP)
 
     stop_event.set()
     drop_thread.join(timeout=5)
 
+    duration = time.time() - sim_start
+
+    if hard_stop:
+        print(f"⛔ Hard stop ({hard_stop_reason}): killing simulation and discarding its files...")
+        cleanup(paths, procs, session_id, archive=False, force=True)
+        return SimResult(
+            outcome="killed",
+            session_id=session_id,
+            run_label=run_label,
+            num_nodes=num_nodes,
+            duration_sec=duration,
+            node_drop_count=node_drop_count,
+            archive=None,
+        )
+
     print("Cleaning up and creating log archive...")
-    cleanup(paths, procs, session_id)
+    archive_path = cleanup(paths, procs, session_id)
+    return SimResult(
+        outcome="completed",
+        session_id=session_id,
+        run_label=run_label,
+        num_nodes=num_nodes,
+        duration_sec=duration,
+        node_drop_count=node_drop_count,
+        archive=str(archive_path) if archive_path else None,
+    )
 
 
 def _expand_sweep(sweep: dict) -> List[dict]:
@@ -897,17 +1065,38 @@ def main() -> None:
         default="",
         help="Path to the persistent node-drop log file (default: <base_dir>/node_drops.log)",
     )
+    parser.add_argument(
+        "--state-log",
+        dest="state_log",
+        type=str,
+        default="",
+        help="Path to the run-state log used for resume (default: <base_dir>/run_state.log)",
+    )
+    parser.add_argument(
+        "--ignore-window",
+        dest="ignore_window",
+        action="store_true",
+        help="Bypass the 00:00-08:00 Israel-time window and 08:00 deadline (manual runs/testing)",
+    )
 
     args = parser.parse_args()
 
-    base_dir = Path(__file__).resolve().parent
-    # Only the shared fields are set here; logs_dir, pids_file, bootstrap_log and
-    # bootstrap_pid_file are derived per-run inside run_one_simulation.
+    # Project root holds the read-only inputs (bin/, configs/ templates). All
+    # disposable runtime output goes under results/. COMMITTEE_SIM_ROOT overrides the
+    # root (used by tests); otherwise it is the repo root: src/committee_sim/<file>.
+    project_root = Path(os.environ.get("COMMITTEE_SIM_ROOT") or Path(__file__).resolve().parents[2])
+    results_dir = project_root / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # base_dir is the OUTPUT root (archives, logs, state, node_drops, bootstrap addr).
+    # bin/ is a read-only input; generated configs live in a transient dir under
+    # results/ so cleanup()'s rmtree never touches the tracked configs/ templates.
+    base_dir = results_dir
     base_paths = Paths(
-        base_dir=base_dir,
-        bin_dir=base_dir / "bin",
-        configs_dir=base_dir / "configs",
-        bootstrap_address_file=base_dir / "bootstrap_address.txt",
+        base_dir=results_dir,
+        bin_dir=project_root / "bin",
+        configs_dir=results_dir / "_generated_configs",
+        bootstrap_address_file=results_dir / "bootstrap_address.txt",
     )
 
     cfg_path = Path(args.batch_config)
@@ -924,13 +1113,115 @@ def main() -> None:
         sys.exit("Error: batch config produced zero runs")
     sleep_between = int(batch_cfg.get("sleep_between_runs_sec", 0) or 0)
 
-    for idx, run in enumerate(runs, start=1):
-        cfg = parse_run(run, args, idx, base_dir)
-        run_one_simulation(base_paths, cfg)
+    state_log = Path(args.state_log) if args.state_log else results_dir / "run_state.log"
+    finished = load_finished_labels(state_log)
 
-        if idx < len(runs) and sleep_between > 0:
-            print(f"Sleeping {sleep_between}s before the next run...")
-            time.sleep(sleep_between)
+    # Telegram control + notifications (no-op unless TELEGRAM_* env is set).
+    stop_flags = StopFlags()
+    notifier = Notifier(stop_flags, base_dir=base_dir)
+    notifier.start()
+
+    def _exit(msg: str, code: int = 0):
+        print(msg)
+        notifier.notify(msg)
+        notifier.stop()
+        sys.exit(code)
+
+    notifier.notify(f"▶️ Runner started. {len(runs)} run(s) configured, {len(finished)} already finished.")
+
+    try:
+        for idx, run in enumerate(runs, start=1):
+            cfg = parse_run(run, args, idx, base_dir)
+
+            if cfg.run_label in finished:
+                print(f"Skipping {cfg.run_label}: already finished.")
+                continue
+
+            # Honour graceful /stop between sims.
+            if stop_flags.stop_requested.is_set():
+                _exit("🟡 Stop requested — exiting before next simulation.")
+
+            # Time-window guards (skippable for manual runs).
+            if not args.ignore_window:
+                if not in_window():
+                    _exit("⏰ Outside the 00:00-08:00 Israel window — exiting.")
+                if not enough_slack():
+                    _exit(f"⏳ Less than {MIN_SLACK_MIN} min before 08:00 — not starting {cfg.run_label}, exiting.")
+
+            # Disk guard: alert + poll until >= MIN_FREE_BYTES, honouring deadline/stop.
+            if not _wait_for_disk(base_dir, notifier, stop_flags, args.ignore_window):
+                _exit("🛑 Aborting: disk space did not recover before the window closed / stop requested.")
+
+            deadline = None if args.ignore_window else window_end_epoch()
+
+            notifier.notify(
+                f"🚀 Starting {cfg.run_label} "
+                f"({cfg.num_nodes} nodes, m={cfg.max_outbound_degree}, d={cfg.diameter})."
+            )
+
+            result = run_one_simulation(base_paths, cfg, deadline_epoch=deadline, stop_flags=stop_flags)
+
+            if result.outcome == "killed":
+                notifier.notify(f"⛔ {cfg.run_label} killed before completion — will rerun next night.")
+                _exit("⛔ Simulation hard-stopped — exiting.")
+
+            # Fully completed: record for resume + send summary.
+            record_finished(state_log, result.run_label, result.session_id, result.archive or "")
+            finished.add(result.run_label)
+            notifier.notify(_summary_text(result))
+
+            if stop_flags.stop_requested.is_set():
+                _exit("🟡 Stop requested — exiting after completed simulation.")
+
+            if idx < len(runs) and sleep_between > 0:
+                print(f"Sleeping {sleep_between}s before the next run...")
+                time.sleep(sleep_between)
+
+        _exit("✅ All configured simulations are finished.")
+    finally:
+        notifier.stop()
+
+
+def _summary_text(result: SimResult) -> str:
+    mins = result.duration_sec / 60.0
+    return (
+        f"✅ {result.run_label} done\n"
+        f"- session: {result.session_id}\n"
+        f"- nodes: {result.num_nodes}\n"
+        f"- duration: {mins:.1f} min\n"
+        f"- nodes dropped: {result.node_drop_count}\n"
+        f"- archive: {Path(result.archive).name if result.archive else 'n/a'}\n"
+        f"- status: ok"
+    )
+
+
+def _wait_for_disk(base_dir: Path, notifier, stop_flags: StopFlags, ignore_window: bool) -> bool:
+    """Block until >= MIN_FREE_BYTES free. Returns False if it gives up.
+
+    Gives up when a stop is requested, or (unless ignore_window) the 08:00 deadline
+    passes. Sends a single Telegram alert when it first detects low space.
+    """
+    if free_bytes(base_dir) >= MIN_FREE_BYTES:
+        return True
+
+    alerted = False
+    while True:
+        free = free_bytes(base_dir)
+        if free >= MIN_FREE_BYTES:
+            if alerted:
+                notifier.notify(f"💾 Disk recovered: {free / (1024 ** 3):.1f} GB free — resuming.")
+            return True
+        if not alerted:
+            notifier.notify(
+                f"⚠️ Low disk: {free / (1024 ** 3):.1f} GB free "
+                f"(< {MIN_FREE_BYTES / (1024 ** 3):.0f} GB). Waiting for space..."
+            )
+            alerted = True
+        if stop_flags.stop_requested.is_set():
+            return False
+        if not ignore_window and seconds_to_window_end() <= 0:
+            return False
+        time.sleep(DISK_POLL_SEC)
 
 
 if __name__ == "__main__":

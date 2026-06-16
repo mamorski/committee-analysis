@@ -1,6 +1,6 @@
 import pytest
 
-from run_simulations import (
+from committee_sim.run_simulations import (
     _ensure_duration,
     _swallow,
     parse_duration,

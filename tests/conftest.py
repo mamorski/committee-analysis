@@ -2,8 +2,8 @@ import argparse
 
 import pytest
 
-import run_simulations
-from run_simulations import Paths
+from committee_sim import run_simulations
+from committee_sim.run_simulations import Paths
 
 
 class FakeProc:
@@ -20,6 +20,7 @@ class FakeProc:
         self.pid = FakeProc._next_pid
         self._returncode = 0 if stopped else None
         self.terminate_calls = 0
+        self.kill_calls = 0
 
     def poll(self):
         return self._returncode
@@ -27,6 +28,10 @@ class FakeProc:
     def terminate(self):
         self.terminate_calls += 1
         self._returncode = 0
+
+    def kill(self):
+        self.kill_calls += 1
+        self._returncode = -9
 
 
 @pytest.fixture

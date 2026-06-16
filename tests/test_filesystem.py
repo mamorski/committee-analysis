@@ -3,7 +3,7 @@ import tarfile
 
 import pytest
 
-from run_simulations import (
+from committee_sim.run_simulations import (
     append_node_drop_log,
     backup_logs,
     ensure_files,

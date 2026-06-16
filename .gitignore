@@ -209,9 +209,14 @@ __marimo__/
 bin/
 .idea/
 
-# logs
+# logs / runtime output (now under results/, patterns kept for safety)
 results/
+logs/
+run_state.log
+node_drops.log
+bootstrap_address.txt
 simulation-*
 analysis_output/
 figures/
 .DS_Store
+*.tar.gz
