@@ -18,6 +18,7 @@ from subprocess import Popen, STDOUT
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
 from tqdm import tqdm
 
 from .telegram_notifier import Notifier, StopFlags, free_bytes
@@ -1085,6 +1086,9 @@ def main() -> None:
     # disposable runtime output goes under results/. COMMITTEE_SIM_ROOT overrides the
     # root (used by tests); otherwise it is the repo root: src/committee_sim/<file>.
     project_root = Path(os.environ.get("COMMITTEE_SIM_ROOT") or Path(__file__).resolve().parents[2])
+    # Load Telegram (and any other) credentials from <project_root>/.env if present.
+    # Real environment variables take precedence over .env values.
+    load_dotenv(project_root / ".env", override=False)
     results_dir = project_root / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 

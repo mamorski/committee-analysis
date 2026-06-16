@@ -47,12 +47,18 @@ Flags: `--state-log <path>` (default `results/run_state.log`), `--ignore-window`
 
 ### Telegram credentials
 
-Set before launching (the runner is a no-op for Telegram if either is unset):
+Put them in a `.env` file at the repo root (gitignored), loaded automatically at
+startup. Copy the template:
 
 ```bash
-export TELEGRAM_BOT_TOKEN=...      # from @BotFather
-export TELEGRAM_CHAT_ID=...        # target chat id
+cp .env.example .env
+# edit .env:
+#   TELEGRAM_BOT_TOKEN=...   # from @BotFather
+#   TELEGRAM_CHAT_ID=...     # target chat id
 ```
+
+Real environment variables override `.env`, so you can also `export` them instead.
+The runner is a no-op for Telegram if either value is missing.
 
 ### Crontab (00:00 start, server in Israel time)
 
