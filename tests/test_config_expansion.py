@@ -70,6 +70,31 @@ class TestExpandRuns:
         runs = _expand_runs(cfg)
         assert [r["number_of_nodes"] for r in runs] == [10, 20]
 
+    def test_sweep_and_runs_combined(self):
+        # Both blocks present: sweep entries first, then runs entries (fanned out).
+        cfg = {
+            "sweep": {
+                "num_nodes": {"from": 10, "to": 20, "step": 10},
+                "max_outbound_degree": 3,
+                "diameter": 2,
+            },
+            "runs": [
+                {"name": "drop", "number_of_nodes": 30, "max_outbound_degree": 3,
+                 "diameter": 2, "node_drop_percent": 5, "repetitions": 2},
+            ],
+        }
+        runs = _expand_runs(cfg)
+        names = [r["name"] for r in runs]
+        # 2 sweep points + 2 fanned-out drop reps = 4 total.
+        assert len(runs) == 4
+        assert names[:2] == ["sweep-10n-rep-01", "sweep-20n-rep-01"]
+        assert names[2:] == ["drop-rep-01", "drop-rep-02"]
+        assert all("repetitions" not in r for r in runs)
+
+    def test_runs_not_a_list_exits(self):
+        with pytest.raises(SystemExit):
+            _expand_runs({"runs": "notalist"})
+
     @pytest.mark.parametrize("cfg", [{}, {"runs": []}, {"runs": "notalist"}])
     def test_missing_runs_exits(self, cfg):
         with pytest.raises(SystemExit):

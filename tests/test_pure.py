@@ -1,12 +1,50 @@
+import resource
+
 import pytest
 
+from committee_sim import run_simulations
 from committee_sim.run_simulations import (
     _ensure_duration,
     _swallow,
     parse_duration,
     percent_to_count,
+    raise_fd_limit,
     validate_args,
 )
+
+
+class TestRaiseFdLimit:
+    def test_raises_soft_to_target_within_hard(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(resource, "getrlimit", lambda _r: (1024, 1048576))
+        monkeypatch.setattr(resource, "setrlimit", lambda _r, v: captured.update(v=v))
+        soft, ok = raise_fd_limit(65536)
+        assert soft == 65536 and ok is True
+        assert captured["v"] == (65536, 1048576)
+
+    def test_caps_at_hard_when_target_exceeds_it(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(resource, "getrlimit", lambda _r: (1024, 4096))
+        monkeypatch.setattr(resource, "setrlimit", lambda _r, v: captured.update(v=v))
+        soft, ok = raise_fd_limit(65536)
+        assert soft == 4096 and ok is False  # shortfall reported
+        assert captured["v"] == (4096, 4096)
+
+    def test_no_setrlimit_when_already_high(self, monkeypatch):
+        called = {"n": 0}
+        monkeypatch.setattr(resource, "getrlimit", lambda _r: (65536, 1048576))
+        monkeypatch.setattr(resource, "setrlimit", lambda *_a: called.__setitem__("n", called["n"] + 1))
+        soft, ok = raise_fd_limit(65536)
+        assert soft == 65536 and ok is True
+        assert called["n"] == 0  # soft already met -> no syscall
+
+    def test_infinite_hard_allows_target(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(resource, "getrlimit", lambda _r: (1024, resource.RLIM_INFINITY))
+        monkeypatch.setattr(resource, "setrlimit", lambda _r, v: captured.update(v=v))
+        soft, ok = raise_fd_limit(65536)
+        assert soft == 65536 and ok is True
+        assert captured["v"] == (65536, resource.RLIM_INFINITY)
 
 
 class TestParseDuration:

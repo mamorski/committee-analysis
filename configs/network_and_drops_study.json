@@ -1,0 +1,70 @@
+{
+    "sleep_between_runs_sec": 10,
+    "sweep": {
+        "num_nodes": { "from": 500, "to": 1000, "step": 20 },
+        "repetitions": 3,
+
+        "max_outbound_degree": 16,
+        "diameter": 4,
+        "committee_size": 50,
+        "log_level": "info",
+
+        "graph_discovery_timeout": "30s",
+        "graph_building_round_timeout": "2m",
+        "graph_building_rounds": 4,
+        "verify_timeout": "10s"
+    },
+    "runs": [
+        {
+            "name": "drop-05pct",
+            "number_of_nodes": 1000,
+            "node_drop_percent": 5,
+            "node_drop_interval_sec": 15,
+            "repetitions": 3,
+
+            "max_outbound_degree": 16,
+            "diameter": 4,
+            "committee_size": 50,
+            "log_level": "info",
+
+            "graph_discovery_timeout": "30s",
+            "graph_building_round_timeout": "2m",
+            "graph_building_rounds": 4,
+            "verify_timeout": "10s"
+        },
+        {
+            "name": "drop-10pct",
+            "number_of_nodes": 1000,
+            "node_drop_percent": 10,
+            "node_drop_interval_sec": 15,
+            "repetitions": 3,
+
+            "max_outbound_degree": 16,
+            "diameter": 4,
+            "committee_size": 50,
+            "log_level": "info",
+
+            "graph_discovery_timeout": "30s",
+            "graph_building_round_timeout": "2m",
+            "graph_building_rounds": 4,
+            "verify_timeout": "10s"
+        },
+        {
+            "name": "drop-15pct",
+            "number_of_nodes": 1000,
+            "node_drop_percent": 15,
+            "node_drop_interval_sec": 15,
+            "repetitions": 3,
+
+            "max_outbound_degree": 16,
+            "diameter": 4,
+            "committee_size": 50,
+            "log_level": "info",
+
+            "graph_discovery_timeout": "30s",
+            "graph_building_round_timeout": "2m",
+            "graph_building_rounds": 4,
+            "verify_timeout": "10s"
+        }
+    ]
+}

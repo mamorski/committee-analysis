@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import resource
 import shutil
 import signal
 import sys
@@ -11,7 +12,7 @@ import tarfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from shutil import rmtree
 from subprocess import Popen, STDOUT
@@ -21,7 +22,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from .telegram_notifier import Notifier, StopFlags, free_bytes
+from .telegram_notifier import Notifier, StopFlags, apply_stop, free_bytes
 
 
 @dataclass
@@ -83,7 +84,31 @@ def percent_to_count(total: int, percent: float) -> int:
     return max(1, math.ceil(total * (percent / 100.0)))
 
 
-PROTOCOL_START_OFFSET_SEC = 60
+# Each node process opens many fds (libp2p conns + DHT + logs); at ~1000 nodes the
+# default soft limit (often 1024) is far too low. We raise it in-process so every
+# Popen'd node inherits the higher soft limit — no wrapper/ulimit/PAM needed.
+FD_LIMIT_TARGET = 65536
+
+
+def raise_fd_limit(target: int = FD_LIMIT_TARGET) -> Tuple[int, bool]:
+    """Raise this process's RLIMIT_NOFILE soft limit toward ``target``.
+
+    Child node processes inherit it. The soft limit can only rise up to the hard
+    cap; if the hard cap is lower we set the soft limit as high as allowed and
+    report the shortfall (raising the hard cap needs root / limits.conf).
+    Returns ``(applied_soft, target_met)``.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard == resource.RLIM_INFINITY:
+        new_soft = target
+    else:
+        new_soft = min(target, hard)
+    if new_soft > soft:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+    return new_soft, new_soft >= target
+
+
+PROTOCOL_START_OFFSET_SEC = 120
 
 # --- Nightly run window (Israel time) -------------------------------------
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -125,6 +150,33 @@ def seconds_to_window_end(now: Optional[float] = None) -> float:
 def enough_slack(now: Optional[float] = None) -> bool:
     """True if there is at least MIN_SLACK_MIN before the window end."""
     return seconds_to_window_end(now) >= MIN_SLACK_MIN * 60
+
+
+def next_window_start_epoch(now: Optional[float] = None) -> float:
+    """Epoch seconds of the next WINDOW_START_HOUR (00:00) in Israel time.
+
+    Always the *next* day's 00:00 relative to the current Israel date (the current
+    day's 00:00 is already in the past whenever this is called). DST-correct: the
+    wall-clock 00:00 is resolved through Asia/Jerusalem on the target date.
+    """
+    local = israel_now(now)
+    next_date = local.date() + timedelta(days=1)
+    start_next = datetime.combine(next_date, dtime(hour=WINDOW_START_HOUR), tzinfo=ISRAEL_TZ)
+    return start_next.timestamp()
+
+
+def sleep_until(epoch: float, stop_flags: "StopFlags", chunk_sec: int = 30) -> bool:
+    """Sleep until ``epoch`` (Unix seconds), in small chunks so a stop is honoured.
+
+    Returns True if the deadline was reached, False if a stop was requested first.
+    """
+    while True:
+        remaining = epoch - time.time()
+        if remaining <= 0:
+            return True
+        if stop_flags.stop_requested.is_set():
+            return False
+        time.sleep(min(chunk_sec, remaining))
 
 
 # --- Run-state log (resume support) ---------------------------------------
@@ -421,10 +473,17 @@ def start_bootstrap_server(paths: Paths) -> Popen:
     server_cfg = str(paths.configs_dir / "dev-server.json")
     # Ensure parent dir exists for bootstrap log (it may live inside logs_dir per run)
     paths.bootstrap_log.parent.mkdir(parents=True, exist_ok=True)
+    # The server writes/removes bootstrap_address.txt relative to its CWD, so run it
+    # in the dir where we read that file from (paths.bootstrap_address_file's parent).
+    server_cwd = paths.bootstrap_address_file.parent
+    server_cwd.mkdir(parents=True, exist_ok=True)
     # Open, spawn, then close our handle to avoid FD leaks in the parent
     with paths.bootstrap_log.open("w") as bootstrap_log_fh:
         proc = Popen(
-            [server_bin, "-config", server_cfg], stdout=bootstrap_log_fh, stderr=STDOUT
+            [server_bin, "-config", server_cfg],
+            stdout=bootstrap_log_fh,
+            stderr=STDOUT,
+            cwd=str(server_cwd),
         )
     paths.bootstrap_pid_file.write_text(str(proc.pid))
     print(f"Bootstrap server started (PID: {proc.pid})")
@@ -622,13 +681,10 @@ def run_one_simulation(
 
     node_id_map: Dict[int, Popen] = {}
 
-    def _handle_signal(_, __):
-        stop_event.set()
-        cleanup(paths, procs, session_id)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    # OS signal handling lives in main(): its handler sets stop_flags.stop_immediate,
+    # which the monitor loop below polls to hard-stop, clean up, and return "killed".
+    # We deliberately do NOT install per-run handlers so main()'s handler (which also
+    # sends the Telegram shutdown notice) stays active for the whole daemon lifetime.
 
     # Determine log level status
     log_level_status = f"{log_level} (default)"
@@ -899,28 +955,37 @@ def _expand_sweep(sweep: dict) -> List[dict]:
 
 
 def _expand_runs(batch_cfg: dict) -> List[dict]:
-    """Return flat run list, expanding sweep or inline repetitions."""
-    if "sweep" in batch_cfg:
-        runs = _expand_sweep(batch_cfg["sweep"])
-    else:
-        runs = batch_cfg.get("runs")
-        if not isinstance(runs, list) or not runs:
-            sys.exit("Error: batch config must contain a non-empty 'runs' array or a 'sweep' block")
+    """Return flat run list, combining an optional sweep block with inline runs.
 
+    A config may carry a ``sweep`` block, a ``runs`` array, or both. When both are
+    present the sweep-expanded entries come first, followed by the runs entries (each
+    fanned out by its own ``repetitions``). At least one source must yield entries.
+    """
     expanded: List[dict] = []
-    for run in runs:
-        reps = int(run.get("repetitions", 1))
-        if reps < 1:
-            sys.exit(f"Error: run '{run.get('name', '?')}' has repetitions < 1")
-        if reps == 1:
-            expanded.append(run)
-        else:
-            base_name = run.get("name", "run")
-            for r in range(1, reps + 1):
-                entry = dict(run)
-                entry.pop("repetitions", None)
-                entry["name"] = f"{base_name}-rep-{r:02d}"
-                expanded.append(entry)
+
+    if "sweep" in batch_cfg:
+        expanded.extend(_expand_sweep(batch_cfg["sweep"]))
+
+    if "runs" in batch_cfg:
+        runs = batch_cfg["runs"]
+        if not isinstance(runs, list):
+            sys.exit("Error: batch config 'runs' must be an array")
+        for run in runs:
+            reps = int(run.get("repetitions", 1))
+            if reps < 1:
+                sys.exit(f"Error: run '{run.get('name', '?')}' has repetitions < 1")
+            if reps == 1:
+                expanded.append(run)
+            else:
+                base_name = run.get("name", "run")
+                for r in range(1, reps + 1):
+                    entry = dict(run)
+                    entry.pop("repetitions", None)
+                    entry["name"] = f"{base_name}-rep-{r:02d}"
+                    expanded.append(entry)
+
+    if not expanded:
+        sys.exit("Error: batch config must contain a non-empty 'runs' array or a 'sweep' block")
     return expanded
 
 
@@ -1082,6 +1147,9 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Raise the open-file limit before launching any nodes; children inherit it.
+    fd_soft, fd_ok = raise_fd_limit()
+
     # Project root holds the read-only inputs (bin/, configs/ templates). All
     # disposable runtime output goes under results/. COMMITTEE_SIM_ROOT overrides the
     # root (used by tests); otherwise it is the repo root: src/committee_sim/<file>.
@@ -1131,26 +1199,51 @@ def main() -> None:
         notifier.stop()
         sys.exit(code)
 
+    # OS shutdown signals: notify via Telegram, then request an immediate stop. The
+    # handler stays installed for the whole daemon lifetime (run_one_simulation no
+    # longer overrides it), so a signal at any point — mid-run or while sleeping
+    # between windows — both sends the notice and unwinds cleanly.
+    def _on_signal(signum, _frame):
+        name = signal.Signals(signum).name
+        notifier.notify(f"🛑 Received {name} — shutting down after the current run is cleaned up.")
+        apply_stop(stop_flags, immediate=True)
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    if not fd_ok:
+        notifier.notify(
+            f"⚠️ Open-file soft limit only {fd_soft} (< {FD_LIMIT_TARGET}); hard cap too low. "
+            "Raise it via /etc/security/limits.conf or run as root — large runs may exhaust fds."
+        )
+
     notifier.notify(f"▶️ Runner started. {len(runs)} run(s) configured, {len(finished)} already finished.")
 
     try:
-        for idx, run in enumerate(runs, start=1):
-            cfg = parse_run(run, args, idx, base_dir)
+        while True:
+            # Re-scan for the first unfinished run each iteration: a run hard-stopped
+            # at the 08:00 deadline is not recorded finished, so it is naturally
+            # retried in the next window instead of being skipped.
+            pending = None
+            for idx, run in enumerate(runs, start=1):
+                cfg = parse_run(run, args, idx, base_dir)
+                if cfg.run_label not in finished:
+                    pending = (idx, cfg)
+                    break
 
-            if cfg.run_label in finished:
-                print(f"Skipping {cfg.run_label}: already finished.")
-                continue
+            if pending is None:
+                _exit("✅ All configured simulations are finished.")
+
+            idx, cfg = pending
 
             # Honour graceful /stop between sims.
             if stop_flags.stop_requested.is_set():
                 _exit("🟡 Stop requested — exiting before next simulation.")
 
-            # Time-window guards (skippable for manual runs).
-            if not args.ignore_window:
-                if not in_window():
-                    _exit("⏰ Outside the 00:00-08:00 Israel window — exiting.")
-                if not enough_slack():
-                    _exit(f"⏳ Less than {MIN_SLACK_MIN} min before 08:00 — not starting {cfg.run_label}, exiting.")
+            # Daemon scheduling: block until inside the 00:00-08:00 window with slack,
+            # sleeping until the next 00:00 when outside it (skipped with --ignore-window).
+            if not _await_window(args, notifier, stop_flags):
+                _exit("🟡 Stop requested — exiting before next simulation.")
 
             # Disk guard: alert + poll until >= MIN_FREE_BYTES, honouring deadline/stop.
             if not _wait_for_disk(base_dir, notifier, stop_flags, args.ignore_window):
@@ -1166,8 +1259,12 @@ def main() -> None:
             result = run_one_simulation(base_paths, cfg, deadline_epoch=deadline, stop_flags=stop_flags)
 
             if result.outcome == "killed":
-                notifier.notify(f"⛔ {cfg.run_label} killed before completion — will rerun next night.")
-                _exit("⛔ Simulation hard-stopped — exiting.")
+                # Distinguish a shutdown stop from hitting the 08:00 window deadline.
+                if stop_flags.stop_requested.is_set():
+                    notifier.notify(f"⛔ {cfg.run_label} stopped before completion.")
+                    _exit("⛔ Simulation hard-stopped — exiting.")
+                notifier.notify(f"⏰ {cfg.run_label} hit the 08:00 window — will resume next window.")
+                continue  # not recorded finished -> retried after _await_window sleeps
 
             # Fully completed: record for resume + send summary.
             record_finished(state_log, result.run_label, result.session_id, result.archive or "")
@@ -1177,11 +1274,8 @@ def main() -> None:
             if stop_flags.stop_requested.is_set():
                 _exit("🟡 Stop requested — exiting after completed simulation.")
 
-            if idx < len(runs) and sleep_between > 0:
-                print(f"Sleeping {sleep_between}s before the next run...")
-                time.sleep(sleep_between)
-
-        _exit("✅ All configured simulations are finished.")
+            if sleep_between > 0 and not sleep_until(time.time() + sleep_between, stop_flags):
+                _exit("🟡 Stop requested — exiting after completed simulation.")
     finally:
         notifier.stop()
 
@@ -1197,6 +1291,30 @@ def _summary_text(result: SimResult) -> str:
         f"- archive: {Path(result.archive).name if result.archive else 'n/a'}\n"
         f"- status: ok"
     )
+
+
+def _await_window(args: argparse.Namespace, notifier, stop_flags: StopFlags) -> bool:
+    """Block until inside the run window with enough slack (daemon scheduling).
+
+    When outside the 00:00-08:00 window (or with < MIN_SLACK_MIN before 08:00), sleep
+    until the next 00:00 IDT and re-check. Returns True when it is OK to start a run,
+    False if a stop was requested. With --ignore-window, returns True immediately.
+    """
+    if args.ignore_window:
+        return True
+    announced = False
+    while True:
+        if stop_flags.stop_requested.is_set():
+            return False
+        if in_window() and enough_slack():
+            return True
+        if not announced:
+            msg = "⏸ Outside the 00:00-08:00 IDT window — sleeping until the next 00:00."
+            print(msg)
+            notifier.notify(msg)
+            announced = True
+        if not sleep_until(next_window_start_epoch(), stop_flags):
+            return False
 
 
 def _wait_for_disk(base_dir: Path, notifier, stop_flags: StopFlags, ignore_window: bool) -> bool:

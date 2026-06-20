@@ -16,6 +16,16 @@ from conftest import FakeProc
 from committee_sim.telegram_notifier import StopFlags
 
 
+def _stop_and_false(epoch, stop_flags, *a, **k):
+    """Stand-in for sleep_until: request a stop and report interruption.
+
+    Lets the daemon's inter-window wait terminate deterministically in tests
+    instead of actually sleeping until the next 00:00.
+    """
+    stop_flags.stop_requested.set()
+    return False
+
+
 class _FakePbar:
     def __enter__(self):
         return self
@@ -69,6 +79,7 @@ def _run_main(
     extra_argv=None,
     node_stopped=True,
     free=50 * 1024 ** 3,
+    signal_registry=None,
 ):
     """Drive main() to completion (it always sys.exit()s). Returns the FakeNotifier."""
     FakeNotifier.instances = []
@@ -92,7 +103,14 @@ def _run_main(
     monkeypatch.setattr(run_simulations, "read_bootstrap_address", lambda p: "/ip4/addr")
     monkeypatch.setattr(run_simulations, "start_node", lambda p, i, c: FakeProc(stopped=node_stopped))
     monkeypatch.setattr(run_simulations.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(run_simulations.signal, "signal", lambda *a, **k: None)
+    if signal_registry is None:
+        monkeypatch.setattr(run_simulations.signal, "signal", lambda *a, **k: None)
+    else:
+        monkeypatch.setattr(
+            run_simulations.signal,
+            "signal",
+            lambda sig, handler: signal_registry.__setitem__(sig, handler),
+        )
     monkeypatch.setattr(run_simulations, "tqdm", lambda *a, **k: _FakePbar())
     monkeypatch.setattr(run_simulations, "free_bytes", lambda _p: free)
     monkeypatch.setattr(run_simulations, "Notifier", FakeNotifier)
@@ -143,37 +161,56 @@ class TestResume:
 
 
 class TestWindowClosed:
-    def test_exits_without_running(self, tmp_path, monkeypatch):
+    def test_waits_for_window_instead_of_running(self, tmp_path, monkeypatch):
+        # Daemon mode: outside the window it sleeps until the next 00:00 rather than
+        # exiting. We stub the sleep to request a stop so the loop terminates.
         monkeypatch.setattr(run_simulations, "in_window", lambda *a: False)
+        monkeypatch.setattr(run_simulations, "sleep_until", _stop_and_false)
         notifier, state_log, base, code = _run_main(tmp_path, monkeypatch)
         assert code == 0
         assert list(base.glob("*.tar.gz")) == []
         assert not state_log.exists() or run_simulations.load_finished_labels(state_log) == set()
         assert not any(m.startswith("🚀") for m in notifier.messages)
+        # It announced that it is waiting for the next window.
+        assert any(m.startswith("⏸") for m in notifier.messages)
 
 
 class TestInsufficientSlack:
-    def test_exits_before_first_sim(self, tmp_path, monkeypatch):
+    def test_waits_when_too_little_slack(self, tmp_path, monkeypatch):
         monkeypatch.setattr(run_simulations, "in_window", lambda *a: True)
         monkeypatch.setattr(run_simulations, "enough_slack", lambda *a: False)
+        monkeypatch.setattr(run_simulations, "sleep_until", _stop_and_false)
         notifier, state_log, base, code = _run_main(tmp_path, monkeypatch)
         assert list(base.glob("*.tar.gz")) == []
         assert run_simulations.load_finished_labels(state_log) == set()
         assert not any(m.startswith("🚀") for m in notifier.messages)
+        assert any(m.startswith("⏸") for m in notifier.messages)
 
 
 class TestDeadlineDuringRun:
-    def test_first_sim_hard_killed_not_recorded(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(run_simulations, "in_window", lambda *a: True)
+    def test_first_sim_hard_killed_then_waits_next_window(self, tmp_path, monkeypatch):
+        # In-window until the sim runs once; the deadline (now) hard-kills it, then the
+        # window is "closed" so the daemon waits for the next 00:00 (stubbed to stop).
+        state = {"ran": False}
         monkeypatch.setattr(run_simulations, "enough_slack", lambda *a: True)
-        # Deadline already passed -> sim is hard-killed on the first poll.
+        monkeypatch.setattr(run_simulations, "in_window", lambda *a: not state["ran"])
         monkeypatch.setattr(run_simulations, "window_end_epoch", lambda *a: run_simulations.time.time())
+        monkeypatch.setattr(run_simulations, "sleep_until", _stop_and_false)
+
+        real = run_simulations.run_one_simulation
+
+        def wrapper(base_paths, cfg, **kwargs):
+            state["ran"] = True
+            return real(base_paths, cfg, **kwargs)
+
+        monkeypatch.setattr(run_simulations, "run_one_simulation", wrapper)
         notifier, state_log, base, code = _run_main(
             tmp_path, monkeypatch, node_stopped=False
         )
+        # Killed-at-deadline run is not recorded -> eligible for retry next window.
         assert run_simulations.load_finished_labels(state_log) == set()
         assert list(base.glob("*.tar.gz")) == []
-        assert any("killed" in m for m in notifier.messages)
+        assert any("08:00 window" in m for m in notifier.messages)
 
 
 class TestGracefulStop:
@@ -193,3 +230,24 @@ class TestGracefulStop:
         # First sim recorded, second skipped due to graceful stop.
         assert run_simulations.load_finished_labels(state_log) == {"run-01-4n-2m-d2"}
         assert len(list(base.glob("*.tar.gz"))) == 1
+
+
+class TestShutdownSignal:
+    def test_sigterm_notifies_and_requests_immediate_stop(self, tmp_path, monkeypatch):
+        import signal as _signal
+
+        registry = {}
+        notifier, state_log, base, code = _run_main(
+            tmp_path, monkeypatch, extra_argv=["--ignore-window"], signal_registry=registry
+        )
+        # main() registered handlers for both signals.
+        assert _signal.SIGTERM in registry and _signal.SIGINT in registry
+
+        # Invoke the SIGTERM handler (closure still holds notifier + stop_flags).
+        notifier_inst = FakeNotifier.instances[-1]
+        notifier_inst.messages.clear()
+        registry[_signal.SIGTERM](_signal.SIGTERM, None)
+
+        assert any(m.startswith("🛑") for m in notifier_inst.messages)
+        assert notifier_inst.stop_flags.stop_requested.is_set()
+        assert notifier_inst.stop_flags.stop_immediate.is_set()
