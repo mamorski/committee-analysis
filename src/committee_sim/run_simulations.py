@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from shutil import rmtree
-from subprocess import Popen, STDOUT
+from subprocess import Popen, STDOUT, run as subprocess_run
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -58,6 +58,7 @@ class RunConfig:
     node_drop_interval_sec: int
     node_drop_log: Path
     verify_timeout: str
+    mdag_timeout: str
     committee_size: int
     graph_building_rounds: int
     graph_discovery_timeout: str
@@ -222,6 +223,76 @@ def _swallow(fn, *args, **kwargs) -> None:
         fn(*args, **kwargs)
     except Exception:
         pass
+
+
+# Max seconds to wait for a bootstrap server to exit after SIGTERM before
+# escalating to SIGKILL. A stale server still bound to the DHT port (4001)
+# causes ~50% of nodes to connect to the wrong peer ID and panic at startup,
+# so the next run must not start until the previous server is fully dead.
+BOOTSTRAP_KILL_TIMEOUT = 10
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _proc_is_bootstrap(pid: int, bin_name: str) -> bool:
+    """True if pid is alive AND its executable basename matches the server
+    binary. Verifying the name guards against killing an unrelated process that
+    has since reused the PID."""
+    if not _pid_alive(pid):
+        return False
+    try:
+        out = subprocess_run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return os.path.basename(out.stdout.strip()) == bin_name
+
+
+def _bootstrap_gone(pid: int, proc: Optional[Popen]) -> bool:
+    """True once the bootstrap process has exited. When ``proc`` is our own
+    child its ``poll()`` reaps the zombie so the PID is truly released;
+    ``os.kill(pid, 0)`` alone would keep reporting an unreaped child as alive."""
+    if proc is not None and proc.poll() is not None:
+        return True
+    return not _pid_alive(pid)
+
+
+def _kill_bootstrap_pid(
+    pid: int, bin_name: str, force: bool = False, proc: Optional[Popen] = None
+) -> None:
+    """Terminate the bootstrap server pid and block until it is gone.
+
+    Sends SIGTERM (or SIGKILL when ``force``), polls until the process exits,
+    and escalates to SIGKILL if it outlives ``BOOTSTRAP_KILL_TIMEOUT``. Pass
+    ``proc`` when the pid is our own child so its zombie gets reaped. No-op if
+    the pid is not (or no longer) our bootstrap server.
+    """
+    if not _proc_is_bootstrap(pid, bin_name):
+        if proc is not None:
+            _swallow(proc.poll)  # reap if it has already exited
+        return
+    _swallow(os.kill, pid, signal.SIGKILL if force else signal.SIGTERM)
+    deadline = time.time() + BOOTSTRAP_KILL_TIMEOUT
+    while time.time() < deadline:
+        if _bootstrap_gone(pid, proc):
+            return
+        time.sleep(0.2)
+    # Didn't exit gracefully within the timeout -> hard kill and reap.
+    _swallow(os.kill, pid, signal.SIGKILL)
+    for _ in range(25):
+        if _bootstrap_gone(pid, proc):
+            return
+        time.sleep(0.2)
 
 
 def _ensure_duration(value: Optional[str]) -> str:
@@ -396,6 +467,7 @@ def write_committee_config(
         bootstrap_address: str,
         log_level: str,
         verify_timeout: str,
+        mdag_timeout: str,
         graph_discovery_timeout: str,
         graph_building_round_timeout: str,
         start_time: int,
@@ -442,13 +514,14 @@ def write_committee_config(
             "type": 0,
             "ex_ante_round_timeout": verify_timeout,
             "ex_post_round_timeout": verify_timeout,
-            "mdag_round_timeout": "10s",
+            "mdag_round_timeout": mdag_timeout,
             "start_time": start_time,
             "graph_discovery_timeout": _ensure_duration(graph_discovery_timeout),
             "graph_building_round_timeout": _ensure_duration(graph_building_round_timeout),
             "time_server": "time.google.com",
         },
         "logger": {"level": log_level},
+        "stats": {"output_dir": str(paths.logs_dir / "stats")},
         "metrics": {
             "enabled": metrics_enabled,
             "push_gateway": {
@@ -471,6 +544,14 @@ def start_bootstrap_server(paths: Paths) -> Popen:
     print("Starting DHT bootstrap server...")
     server_bin = str(paths.bin_dir / "server")
     server_cfg = str(paths.configs_dir / "dev-server.json")
+    # Reap any stale bootstrap server still holding port 4001 (e.g. orphaned by a
+    # crashed prior run where cleanup() never ran). It would otherwise co-bind via
+    # SO_REUSEPORT and steal ~50% of node connections with a wrong peer ID.
+    if paths.bootstrap_pid_file.is_file():
+        stale_pid = paths.bootstrap_pid_file.read_text().strip()
+        if stale_pid:
+            print(f"Reaping stale bootstrap server (PID: {stale_pid})...")
+            _kill_bootstrap_pid(int(stale_pid), os.path.basename(server_bin))
     # Ensure parent dir exists for bootstrap log (it may live inside logs_dir per run)
     paths.bootstrap_log.parent.mkdir(parents=True, exist_ok=True)
     # The server writes/removes bootstrap_address.txt relative to its CWD, so run it
@@ -525,6 +606,10 @@ def backup_logs(paths: Paths, session_id: str) -> Path:
         # Add only node logs, exclude bootstrap.log
         for log_file in paths.logs_dir.glob("node-*.log"):
             tar.add(log_file, arcname=f"{session_id}/{log_file.name}")
+        # Add per-node stats reports (written by each node into logs_dir/stats/).
+        stats_dir = paths.logs_dir / "stats"
+        for stats_file in stats_dir.glob("stats-*.json"):
+            tar.add(stats_file, arcname=f"{session_id}/stats/{stats_file.name}")
     return archive_path
 
 
@@ -551,15 +636,19 @@ def cleanup(
         if p.poll() is None:
             _swallow(p.kill if force else p.terminate)
 
-    # Stop bootstrap server
+    # Stop bootstrap server. Block until it is actually dead before unlinking the
+    # PID file, so the next run cannot start a server that co-binds port 4001
+    # alongside this one (which round-robins ~50% of nodes onto a stale peer ID).
     if paths.bootstrap_pid_file.is_file():
-        boot_sig = signal.SIGKILL if force else signal.SIGTERM
+        bin_name = (paths.bin_dir / "server").name
 
-        def _kill_bootstrap():
+        def _stop_bootstrap():
             boot_pid_str = paths.bootstrap_pid_file.read_text().strip()
             if boot_pid_str:
-                os.kill(int(boot_pid_str), boot_sig)
-        _swallow(_kill_bootstrap)
+                _kill_bootstrap_pid(
+                    int(boot_pid_str), bin_name, force, proc=procs.server_proc
+                )
+        _swallow(_stop_bootstrap)
         _swallow(paths.bootstrap_pid_file.unlink, missing_ok=True)
 
     archive_path: Optional[Path] = None
@@ -605,6 +694,7 @@ def run_one_simulation(
     node_drop_interval_sec = cfg.node_drop_interval_sec
     node_drop_log = cfg.node_drop_log
     verify_timeout = cfg.verify_timeout
+    mdag_timeout = cfg.mdag_timeout
     committee_size = cfg.committee_size
     graph_building_rounds = cfg.graph_building_rounds
     graph_discovery_timeout = cfg.graph_discovery_timeout
@@ -772,6 +862,7 @@ def run_one_simulation(
             drop_on_send_enabled=drop_on_send_flag,
             drop_on_send_probability=drop_on_send_probability if drop_on_send_flag else 0.0,
             verify_timeout=verify_timeout,
+            mdag_timeout=mdag_timeout,
             graph_discovery_timeout=graph_discovery_timeout,
             graph_building_round_timeout=graph_building_round_timeout,
             start_time=protocol_start_time,
@@ -897,6 +988,14 @@ def run_one_simulation(
 
     duration = time.time() - sim_start
 
+    # Guard against the race where SIGINT/SIGTERM reaches child processes before
+    # the monitor loop polls stop_immediate: nodes exit via the signal, the loop
+    # exits via running_count==0 with hard_stop still False, and the simulation
+    # would be incorrectly recorded as finished.
+    if not hard_stop and stop_flags.stop_immediate.is_set():
+        hard_stop = True
+        hard_stop_reason = "stop requested (nodes exited after signal)"
+
     if hard_stop:
         print(f"⛔ Hard stop ({hard_stop_reason}): killing simulation and discarding its files...")
         cleanup(paths, procs, session_id, archive=False, force=True)
@@ -1011,6 +1110,7 @@ def parse_run(run: dict, args: argparse.Namespace, idx: int, base_dir: Path) -> 
     node_drop_interval_sec = int(run.get("node_drop_interval_sec", args.node_drop_interval_sec))
     peer_drop_percent = float(run.get("peer_drop_percent", 0.0))
     verify_timeout = str(run.get("verify_timeout", "30s"))
+    mdag_timeout = str(run.get("mdag_timeout", "5s"))
     committee_size = int(run.get("committee_size", 30))
 
     graph_discovery_timeout = run.get("graph_discovery_timeout")
@@ -1053,6 +1153,7 @@ def parse_run(run: dict, args: argparse.Namespace, idx: int, base_dir: Path) -> 
         node_drop_interval_sec=node_drop_interval_sec,
         node_drop_log=node_drop_log,
         verify_timeout=verify_timeout,
+        mdag_timeout=mdag_timeout,
         committee_size=committee_size,
         graph_building_rounds=graph_building_rounds,
         graph_discovery_timeout=graph_discovery_timeout,

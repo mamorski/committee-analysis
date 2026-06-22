@@ -37,6 +37,20 @@ class TestStartBootstrapServer:
         proc = start_bootstrap_server(base_paths)
         assert base_paths.bootstrap_pid_file.read_text().strip() == str(proc.pid)
 
+    def test_reaps_stale_server_before_spawn(self, base_paths, monkeypatch):
+        # A leftover pid file from a crashed prior run whose server still holds
+        # the DHT port must be killed before the new server spawns.
+        base_paths.bootstrap_pid_file.write_text("9999")
+        reaped = []
+        monkeypatch.setattr(
+            run_simulations, "_kill_bootstrap_pid",
+            lambda pid, name, *a, **k: reaped.append((pid, name)),
+        )
+        monkeypatch.setattr(run_simulations, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(run_simulations.time, "sleep", lambda *_: None)
+        start_bootstrap_server(base_paths)
+        assert reaped == [(9999, "server")]
+
 
 class TestReadBootstrapAddress:
     def test_returns_stripped_address(self, base_paths):
@@ -108,6 +122,8 @@ class TestCleanup:
 
         kills = []
         monkeypatch.setattr(run_simulations.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        monkeypatch.setattr(run_simulations, "_proc_is_bootstrap", lambda *a, **k: True)
+        monkeypatch.setattr(run_simulations, "_pid_alive", lambda *a, **k: False)
 
         cleanup(base_paths, procs, "sess-1")
 
@@ -131,6 +147,8 @@ class TestHardKillCleanup:
 
         kills = []
         monkeypatch.setattr(run_simulations.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+        monkeypatch.setattr(run_simulations, "_proc_is_bootstrap", lambda *a, **k: True)
+        monkeypatch.setattr(run_simulations, "_pid_alive", lambda *a, **k: False)
 
         result = cleanup(base_paths, procs, "sess-1", archive=False, force=True)
 
